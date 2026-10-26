@@ -1,0 +1,26 @@
+# Insert the Qoder provider bundle into the profile composition.
+# The `config` below mirrors this plugin's Config schema; edit values here or
+# through the Web UI Settings panel after installation.
+- insert:
+    - id: llm-qoder
+      name: '@local/dsh-plugin-qoder'
+      config:
+        apiKeyEnv: QODER_API_KEY
+        # Must match the account's Qoder region: global https://api.qoder.com,
+        # China https://api.qoder.com.cn. A token from one region is rejected
+        # by the other with 401 TOKEN_INVALID ("invalid pt-token").
+        baseURL: https://api.qoder.com.cn
+        # Model ids are region-specific; the China catalog has no `ultimate`.
+        defaultModel: dmodel
+        # Context window reported to dsh (it drives dsh's own compaction budget).
+        # 0 = take the window Qoder's model catalog states for the selected model.
+        contextWindow: 0
+        # Optional Qoder-side tier sent as the Agent's `model.context_window`; it must
+        # be one of that model's `available_context_windows`. 0 = keep the model default.
+        # Bigger tiers cost more Qoder credits per turn.
+        agentContextWindow: 0
+        maxTokens: 8192
+        systemPrompt: ""
+        environmentId: ""
+        autoCreateEnvironment: true
+        agentTools: Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch

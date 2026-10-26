@@ -1,0 +1,14 @@
+# Local scratch / artifacts. NOTE: `node_modules/@deepseek-ai` is intentionally
+# committed (vendored MIT deps, see README), so node_modules is NOT ignored here.
+*.log
+*.bak-qoder-*
+package-lock.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
+node_modules/.pnpm/
+node_modules/.package-lock.json
+node_modules/.modules.yaml
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

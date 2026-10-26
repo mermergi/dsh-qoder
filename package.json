@@ -1,0 +1,47 @@
+{
+  "name": "@local/dsh-plugin-qoder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Log in to Qoder with a Personal Access Token and use Qoder Cloud models as an LLM provider inside DeepSeek Harness.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    }
+  },
+  "meta": {
+    "title": "Qoder Provider",
+    "description": "登录 Qoder 并把 Qoder Cloud 模型作为 dsh 的 LLM Provider 使用（PAT 鉴权，Cloud Agent 会话桥接）。"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-llm": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT"
+}
