@@ -97,6 +97,27 @@ dsh 每次调用适配器时，`options.tools` 给的是**当前 agent 可见的
 报得**小于等于**云端真实窗口。若你看到 dsh 一直不压缩而 Qoder 开始丢早期上下文，
 就调低 `agentContextWindow` 或新开一个会话。
 
+#### 换了模型 / 重启之后，模型为什么「失忆」？（已修，2026-10-26）
+
+Session 是按「会话 + 模型」缓存的，**换模型 = 新建云端 Session = 云端历史为空**；重启
+dsh 同理。原实现只发最新一条 user 消息，于是模型完全不记得前文。
+
+现在（`replayHistory`，默认 `true`）遇到**冷 Session** 时，会先从 dsh 自己的历史里
+拼一段转写（`user:` / `assistant:` 逐条，保留最近的、总共 ≤ 24k 字符，单条 ≤ 2.5k），
+夹在本次 user 消息之前一起发出：
+
+```
+[Context replay: transcript of this conversation before the current message, …]
+user: ……
+assistant: ……
+[End of context replay. The current request follows.]
+<当前用户输入>
+```
+
+只用一次（之后 `fresh` 置为 false，不会重复灌）。工具往返**不进转写**——云端 Session
+自己会重放它的工具循环，把旧的工具结果塞回去反而会被当成「再执行一次」。代价是冷启动
+那一轮的输入 token 变多；不想要就把 `replayHistory` 设成 `false`。
+
 #### 那云端上下文满了会怎么样？
 
 **Qoder 会在服务端自己压缩（compaction），而不是直接把请求拒掉**：
@@ -235,6 +256,7 @@ refs:
 | `bridgeLocalTools` | `true` | 把 dsh 的本地工具发布为 Qoder 自定义工具，由 dsh 在**本机**执行 |
 | `cloudTools` | `DeliverArtifacts` | 桥接时仍保留的 Qoder 内置工具。**不要**加入 `Read/Write/Edit/Bash/Glob/Grep`，否则模型会读云端沙箱而不是你的磁盘；留空则退化为仅 `DeliverArtifacts` |
 | `localToolPrefix` | `dsh_` | 桥接工具名前缀（Qoder 禁止 custom 工具与内置重名），回传 dsh 时会自动去掉 |
+| `replayHistory` | `true` | 冷 Session（换模型 / 重启后）先把 dsh 侧历史转写灌进去，避免模型「失忆」。冷启动那轮输入 token 会变多 |
 
 ## 已知限制（重要）
 
@@ -284,6 +306,47 @@ curl.exe -s "https://api.qoder.com/api/v1/cloud/models" -H "Authorization: Beare
 - 返回 `{"data":[...]}`：链路与令牌都正常，模型列表应能完整拉取；
 - 返回 `401`（`TOKEN_INVALID`）：先确认区域与 `baseURL` 一致（全球 `api.qoder.com` / 中国 `api.qoder.com.cn`），换对端点即可；一致仍 401 则令牌无效/过期，需重新生成。
 - 超时/连接重置：网络问题（代理、防火墙或中间盒），先切换网络再试。
+
+## 故障排查：消息发出去一直转圈，最后超时
+
+按可能性排序，两个原因都实测过（2026-10-26，Android/Termux，dsh 0.2.1-rc.2）：
+
+1. **Qoder 云端排队（免费档最常见）**。用 `GET /api/v1/cloud/sessions/{id}/events?limit=20&order=desc`
+   能看到 `session.error`：
+
+   ```json
+   {"error":{"message":"model provider queued the request","qoder_error_code":"10605",
+             "retry_status":{"type":"retrying"},"type":"model_overloaded_error"}}
+   ```
+
+   同时 `session.status_rescheduled`、`stats.active_seconds` 几乎不涨。这是**模型侧过载**，不是插件问题：
+   换一个档位（`gfmodel` GLM-5.3-Flash / `mmodel` MiniMax-M3.1-Flash 是 0.1 倍，实测几秒就回），
+   或稍后重试；免费档（`dfmodel` / `qfmodel`，`price_factor = 0`）被排队的概率最高。
+
+2. **已修复的死锁（2026-10-26）**：旧代码先 `GET .../events/stream` 开流、再 `POST .../events` 发消息。
+   而 Node 的 `fetch`（undici）在**同源已有响应正在流式传输时，不会返回另一个请求的响应**，于是 POST
+   永远等不到响应——云端其实已经收下消息并跑完了本轮，客户端却一直空转（`curl` 无此限制，170ms 返回）。
+   现在改成**先 POST 再开流**，并把 POST 返回的事件 id 作为 `Last-Event-ID` 交给流，由服务端从该 id
+   之后重放，所以不会漏事件。
+
+## 故障排查：`session is busy with a previous turn`（点过「停止」之后发不出去）
+
+**已修复（2026-10-26）。** 症状：在 UI 里点了停止，之后再发消息就报
+`qoder: session is busy with a previous turn`；换模型、退出重进都没用，整个会话废掉。
+
+原因：本地取消只是断开了 SSE 连接，**没有告诉 Qoder 停止那一轮**。云端那轮继续跑
+（排队场景下还会一直 retry），Session 就一直被占着，后续每次 POST 都收到 409。
+
+修法两层：
+
+1. **取消即通知云端**：本地 abort（用户点停止、或 5 分钟空闲上限触发）时补发一个
+   `user.interrupt` 事件，让云端那一轮真正停下。
+2. **409 原位恢复**：真遇到 409 时，先 `user.interrupt`，再轮询 `GET /sessions/{id}`
+   等它回到 `idle`（最多 20 秒），然后重试本次 POST 一次——会话不用重开，云端历史也还在。
+
+顺带一提：卡住的会话会**持续计费**（实测一个卡了 24 分钟的会话累计 `total_credits`
+5.56，其中 `sandbox_runtime_credits` 4.66）。桥接模式每轮都会拉起云端沙箱，所以
+「免费模型」不等于零成本——模型费可能是 0，沙箱运行时间照扣。
 
 ## 仓库结构
 

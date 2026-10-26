@@ -73,6 +73,29 @@ const PROVIDER_DISPLAY = "Qoder";
 const CLOUD_API = "/api/v1/cloud";
 /** Idle ceiling for one streamed turn before the connection is aborted. */
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300000;
+/**
+ * How long to wait for a Session that answered 409 to become idle again. Qoder
+ * retries an overloaded model with `session.status_rescheduled`, which holds the
+ * Session for as long as the retry loop lasts; past this ceiling the turn fails
+ * with SESSION_BUSY instead of hanging.
+ */
+const BUSY_WAIT_TIMEOUT_MS = 20000;
+/** Ceiling for the best-effort `user.interrupt` sent when a turn is cancelled locally. */
+const INTERRUPT_TIMEOUT_MS = 8000;
+/**
+ * Replay budget for a cold Session: how much of the earlier conversation the
+ * client sends along with the first message after a model switch or a host
+ * restart. Kept modest because this text is billed as input tokens every time a
+ * Session has to be rebuilt, and because a truncated transcript is still far
+ * better than a model that believes the conversation just started.
+ */
+const REPLAY_BUDGET_CHARS = 24000;
+/** Per-turn ceiling inside the replayed transcript. */
+const REPLAY_ENTRY_CHARS = 2500;
+/** Opens the replayed transcript (see buildHistoryReplay). */
+const REPLAY_HEADER = "[Context replay: transcript of this conversation before the current message, supplied by the dsh client because this cloud Session was just created. Treat it as already-spoken history; do not repeat or summarise it.]";
+/** Separates the replayed transcript from the actual request. */
+const REPLAY_FOOTER = "[End of context replay. The current request follows.]";
 /** Attribution user-agent, since the shared `attributionHeaders()` is not importable. */
 const USER_AGENT = "dsh-plugin-qoder/1.0";
 /**
@@ -142,6 +165,12 @@ const Config = z.object({
 	// Required because a custom tool name may not collide with a built-in name
 	// such as Read/Bash; it is stripped again when the call is handed back to dsh.
 	localToolPrefix: z.string().default("dsh_"),
+	// When true (default) a *cold* cloud Session (just rebuilt after a model switch,
+	// a host restart, or an abandoned Session) is seeded with a transcript of the
+	// dsh-side conversation, so switching models no longer makes the model forget
+	// everything. Costs input tokens only on that first turn; turn it off to keep
+	// the cloud Session strictly server-side-history-only.
+	replayHistory: z.boolean().default(true),
 	displayName: z.string().default(PROVIDER_DISPLAY),
 });
 
@@ -221,6 +250,7 @@ function resolveConnection(config, env = readProcessEnv) {
 		bridgeLocalTools: pick(config, "bridgeLocalTools") !== false,
 		cloudTools: str(pick(config, "cloudTools"), "DeliverArtifacts").split(",").map((tool) => tool.trim()).filter(Boolean),
 		localToolPrefix: str(pick(config, "localToolPrefix"), "dsh_"),
+		replayHistory: pick(config, "replayHistory") !== false,
 		displayName: str(pick(config, "displayName"), PROVIDER_DISPLAY),
 		ambientKey: ambient
 	};
@@ -286,6 +316,72 @@ function extractUserText(messages) {
 		if (text.length > 0) return text;
 	}
 	return "";
+}
+
+/**
+ * Collect the trailing run of user messages — everything dsh splices into the
+ * current turn, in order. A brand-new Qoder Session has no server-side history
+ * to lean on, and dsh places the task text *before* the workspace, runtime
+ * context, and skills reminders of that same turn, so forwarding only the newest
+ * user message hands the cloud agent a bare reminder and no task at all.
+ * Stops at the first non-user message, so a resumed conversation still forwards
+ * only the current turn and never replays earlier assistant turns.
+ * @param messages - dsh message history.
+ * @returns the current turn's user texts joined in order, or "" when none.
+ */
+function extractTurnUserText(messages) {
+	if (!Array.isArray(messages)) return "";
+	const texts = [];
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index];
+		if (message?.role !== "user" || !Array.isArray(message.content)) break;
+		const text = message.content.filter((block) => block?.type === "text" && typeof block.text === "string" && block.text.length > 0).map((block) => block.text).join("\n");
+		if (text.length > 0) texts.push(text);
+	}
+	return texts.reverse().join("\n\n");
+}
+
+/**
+ * Rebuild a readable transcript of everything spoken before the current turn.
+ *
+ * dsh re-sends the whole conversation on every call, so this is the client's only
+ * source of history once a Qoder Session has to be rebuilt (model switch, host
+ * restart, abandoned Session). Tool traffic is omitted on purpose: the cloud
+ * Session replays its own tool loop, and a transcript of stale tool results would
+ * read as instructions to run them again.
+ * @param messages - dsh message history, including the current turn at the tail.
+ * @param budgetChars - total character ceiling; the newest turns are kept.
+ * @returns labelled `user:` / `assistant:` lines, or "" when there is no history.
+ */
+function buildHistoryReplay(messages, budgetChars = REPLAY_BUDGET_CHARS) {
+	if (!Array.isArray(messages) || messages.length === 0) return "";
+	// The trailing run of user messages is the CURRENT turn (dsh splices the task
+	// text, workspace reminder, runtime context and skills notice as consecutive
+	// user messages); everything before it is history.
+	let start = messages.length;
+	while (start > 0 && messages[start - 1]?.role === "user") start -= 1;
+	const entries = [];
+	for (let index = 0; index < start; index += 1) {
+		const message = messages[index];
+		if (message?.role !== "user" && message?.role !== "assistant") continue;
+		if (!Array.isArray(message.content)) continue;
+		const text = message.content.filter((block) => block?.type === "text" && typeof block.text === "string" && block.text.length > 0).map((block) => block.text).join("\n").trim();
+		if (text.length === 0) continue;
+		const clipped = text.length > REPLAY_ENTRY_CHARS ? `${text.slice(0, REPLAY_ENTRY_CHARS)}…` : text;
+		entries.push(`${message.role === "user" ? "user" : "assistant"}: ${clipped}`);
+	}
+	if (entries.length === 0) return "";
+	// Keep the newest entries that fit the budget: the tail of a conversation is
+	// what the next answer actually depends on.
+	const kept = [];
+	let total = 0;
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const size = entries[index].length + 1;
+		if (total + size > budgetChars) break;
+		kept.unshift(entries[index]);
+		total += size;
+	}
+	return kept.join("\n\n");
 }
 
 //#region local-tool bridge
@@ -395,7 +491,12 @@ function toolInputSchema(tool) {
 function buildCustomTools(prefix, tools, budget = QODER_MAX_TOOL_ENTRIES) {
 	const custom = [];
 	const dropped = [];
-	if (!Array.isArray(tools)) return { custom, dropped };
+	// Qoder only accepts `[A-Za-z0-9_]` tool names, so a declared name can differ
+	// from the dsh name (e.g. `mcp__bili-duty__x` → `mcp__bili_duty__x`). Keep the
+	// reverse map: the model calls back with the sanitised name, and dsh must still
+	// be handed its original one or the dispatcher reports `unknown tool`.
+	const byCustomName = /* @__PURE__ */ new Map();
+	if (!Array.isArray(tools)) return { custom, dropped, byCustomName };
 	const seen = /* @__PURE__ */ new Set();
 	for (const tool of tools) {
 		const dshName = tool?.name;
@@ -414,8 +515,9 @@ function buildCustomTools(prefix, tools, budget = QODER_MAX_TOOL_ENTRIES) {
 			description: str(tool.description, dshName),
 			input_schema: toolInputSchema(tool)
 		});
+		byCustomName.set(key, dshName);
 	}
-	return { custom, dropped };
+	return { custom, dropped, byCustomName };
 }
 
 /**
@@ -603,27 +705,87 @@ class QoderClient {
 		if (!created?.id) throw new QoderError("qoder: session creation returned no id", "INVALID_RESPONSE");
 		return { sessionId: created.id, effectiveContextWindow: positiveInt(created?.agent?.model?.effective_context_window, 0) };
 	}
+	/** Raw POST /events; the caller owns status handling. */
+	postEvents(sessionId, events, signal) {
+		return this.raw(`${CLOUD_API}/sessions/${encodeURIComponent(sessionId)}/events`, {
+			method: "POST",
+			"headers": { "content-type": "application/json" },
+			body: JSON.stringify({ events })
+		}, signal);
+	}
+	/**
+	 * Ask a Session to stop its current turn (`user.interrupt` is one of the
+	 * accepted client events). Harmless on an already-idle Session; the caller
+	 * decides whether a failure matters.
+	 * @param sessionId - the Session to interrupt.
+	 * @param signal - cancellation.
+	 */
+	async interrupt(sessionId, signal) {
+		const response = await this.postEvents(sessionId, [{ type: "user.interrupt" }], signal);
+		if (!response.ok) {
+			const text = await response.text().catch(() => "");
+			throw httpError("qoder: failed to interrupt the session", response.status, text);
+		}
+		return safeJson(response);
+	}
+	/** Current Session status, or undefined when the read failed. */
+	async sessionStatus(sessionId, signal) {
+		const response = await this.raw(`${CLOUD_API}/sessions/${encodeURIComponent(sessionId)}`, { method: "GET" }, signal);
+		if (!response.ok) return void 0;
+		return (await safeJson(response))?.status;
+	}
+	/**
+	 * Wait for a busy Session to finish the turn holding it.
+	 *
+	 * `session.status_rescheduled` is Qoder retrying an overloaded model, and that
+	 * loop can hold a Session for minutes — longer than any usable turn.
+	 * @param sessionId - the Session to poll.
+	 * @param signal - cancellation.
+	 * @param timeoutMs - ceiling; false is returned when it expires.
+	 * @returns whether the Session is idle.
+	 */
+	async waitForIdle(sessionId, signal, timeoutMs = BUSY_WAIT_TIMEOUT_MS) {
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			signal?.throwIfAborted?.();
+			const status = await this.sessionStatus(sessionId, signal).catch(() => void 0);
+			if (status === "idle") return true;
+			if (status === "terminated" || status === "deleted") return false;
+			if (Date.now() >= deadline) return false;
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
+	}
 	/**
 	 * POST one batch of client events to a Session. Shared by user turns and
-	 * custom-tool results so a busy (409) Session fails uniformly.
+	 * custom-tool results.
+	 *
+	 * A 409 means the previous turn still owns the Session — the ordinary cause is
+	 * a turn the user stopped locally (nothing told Qoder to stop, so it kept
+	 * running, or kept retrying an overloaded model). Recover in place: cancel that
+	 * turn, wait for idle, then retry once. Without this the Session stays busy and
+	 * every later turn fails with "session is busy with a previous turn", even
+	 * after switching models or reopening the conversation.
 	 * @param sessionId - target Session.
 	 * @param events - array of `{ type, ... }` event objects.
 	 * @param signal - cancellation.
 	 * @returns the parsed response payload.
 	 */
 	async sendEvents(sessionId, events, signal) {
-		const response = await this.raw(`${CLOUD_API}/sessions/${encodeURIComponent(sessionId)}/events`, {
-			method: "POST",
-			"headers": { "content-type": "application/json" },
-			body: JSON.stringify({ events })
-		}, signal);
+		let response = await this.postEvents(sessionId, events, signal);
+		if (response.status === 409) {
+			await this.interrupt(sessionId, signal).catch(() => {});
+			if (await this.waitForIdle(sessionId, signal)) {
+				response = await this.postEvents(sessionId, events, signal);
+			}
+		}
 		const payload = await safeJson(response);
 		if (response.status === 409) throw new QoderError("qoder: session is busy with a previous turn", "SESSION_BUSY", { cause: errorDetail(payload) });
 		if (!response.ok) throw httpError("qoder: failed to send event", response.status, JSON.stringify(payload));
 		return payload;
 	}
 	async sendUserMessage(sessionId, text, signal) {
-		return this.sendEvents(sessionId, [{ type: "user.message", content: [{ type: "text", text }] }], signal);
+		const payload = await this.sendEvents(sessionId, [{ type: "user.message", content: [{ type: "text", text }] }], signal);
+		return lastEventIdOf(payload);
 	}
 	/**
 	 * Resume a Session paused on `requires_action` by returning custom tool
@@ -640,12 +802,28 @@ class QoderClient {
 			content: result.blocks,
 			is_error: result.isError === true
 		}));
-		return this.sendEvents(sessionId, events, signal);
+		const payload = await this.sendEvents(sessionId, events, signal);
+		return lastEventIdOf(payload);
 	}
-	openStream(sessionId, signal) {
+	/**
+	 * Open the Session event stream.
+	 *
+	 * `lastEventId` is the id of the event this client just posted; passing it as
+	 * `Last-Event-ID` makes the stream replay everything recorded after it, so the
+	 * ordering "post first, subscribe second" loses nothing. That ordering matters:
+	 * Node's `fetch` (undici) never returns a request's response while another
+	 * response from the same origin is still streaming, so the previous
+	 * "subscribe first, then post" sequence deadlocked on the POST — the Session
+	 * had already recorded the user message and run the turn, while the client sat
+	 * waiting for a response that could not be delivered (curl, which has no such
+	 * constraint, returned in ~170 ms).
+	 */
+	openStream(sessionId, signal, lastEventId) {
+		const headers = { "accept": "text/event-stream" };
+		if (typeof lastEventId === "string" && lastEventId.length > 0) headers["last-event-id"] = lastEventId;
 		return this.raw(`${CLOUD_API}/sessions/${encodeURIComponent(sessionId)}/events/stream`, {
 			method: "GET",
-			"headers": { "accept": "text/event-stream" }
+			headers
 		}, signal);
 	}
 	async listModels(signal) {
@@ -665,6 +843,20 @@ async function safeJson(response) {
 	} catch {
 		return { raw: text };
 	}
+}
+/**
+ * Last event id in a POST /events response, usable as the stream's
+ * `Last-Event-ID` cursor so the replay picks up exactly after it.
+ * @param payload - parsed `{ data: [{ id, type, ... }] }` response.
+ * @returns the last id, or undefined when the response carried none.
+ */
+function lastEventIdOf(payload) {
+	const list = Array.isArray(payload?.data) ? payload.data : [];
+	for (let index = list.length - 1; index >= 0; index -= 1) {
+		const id = list[index]?.id;
+		if (typeof id === "string" && id.length > 0) return id;
+	}
+	return void 0;
 }
 function errorDetail(payload) {
 	const message = payload?.error?.message ?? payload?.message ?? payload?.raw;
@@ -862,6 +1054,20 @@ class QoderSessionAdapter {
 			stream: (options) => this.stream(options)
 		};
 	}
+	/**
+	 * Best-effort `user.interrupt` on a short, independent abort budget.
+	 *
+	 * Runs while the turn's own signal is already aborted, so it must not reuse it.
+	 * @param client - request-scoped Qoder client.
+	 * @param sessionId - the Session to release.
+	 */
+	async #interruptQuietly(client, sessionId) {
+		try {
+			await client.interrupt(sessionId, AbortSignal.timeout(INTERRUPT_TIMEOUT_MS));
+		} catch (error) {
+			this.#warn(`qoder: could not interrupt the cloud session ${sessionId} (the next turn will retry): ${error?.message ?? error}`);
+		}
+	}
 	/** Drop every cached Session/agent/environment so new config takes effect. */
 	reset() {
 		this.#sessions.clear();
@@ -880,7 +1086,7 @@ class QoderSessionAdapter {
 		const model = str(options.model, connection.defaultModel);
 		// One slot of Qoder's 128-entry budget goes to the cloud toolset declaration,
 		// so at most 127 dsh tools can be bridged in a single turn.
-		const { custom: customTools, dropped } = bridge ? buildCustomTools(prefix, options.tools, QODER_MAX_TOOL_ENTRIES - 1) : { custom: [], dropped: [] };
+		const { custom: customTools, dropped, byCustomName } = bridge ? buildCustomTools(prefix, options.tools, QODER_MAX_TOOL_ENTRIES - 1) : { custom: [], dropped: [], byCustomName: /* @__PURE__ */ new Map() };
 		if (dropped.length > 0) this.#warn(`qoder: ${dropped.length} local tool(s) exceed Qoder's ${QODER_MAX_TOOL_ENTRIES}-entry limit and were not offered this turn: ${dropped.join(", ")}`);
 		const sessionTools = buildSessionTools(connection, customTools, bridge);
 		if (process.env.QODER_DEBUG) console.error(`[qoder-dbg] model=${model} bridge=${bridge} prefix=${JSON.stringify(prefix)} tools_in=${options.tools?.length ?? "undefined"} session=${JSON.stringify(sessionTools.map((t) => t.name ?? t.type))}`);
@@ -903,14 +1109,17 @@ class QoderSessionAdapter {
 		};
 		const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
 		armIdle();
+		/** Set once the conversation exists, so the failure path can release the cloud turn. */
+		let conversation;
 		try {
 			const record = await this.#ensureConversation(client, options.sessionId, modelSpec, sessionTools, bridge, signal);
-			// Subscribe first, then trigger the turn, so no event is missed.
-			const streamResponse = await client.openStream(record.sessionId, signal);
-			if (!streamResponse.ok || streamResponse.body === null) {
-				const text = await streamResponse.text().catch(() => "");
-				throw httpError("qoder: failed to open event stream", streamResponse.status, text);
-			}
+			conversation = record;
+			// Trigger the turn first and subscribe second, using the posted event's id
+			// as the stream's `Last-Event-ID` cursor: the stream then replays every
+			// event recorded after it, so nothing is missed. The opposite order
+			// deadlocks — see openStream() for why Node's fetch cannot post while a
+			// same-origin response is still streaming.
+			let lastEventId;
 			if (record.phase === "awaiting") {
 				// dsh has just executed the pending local tools and re-called us with
 				// their results appended to history. Forward those results to the SAME
@@ -919,7 +1128,7 @@ class QoderSessionAdapter {
 				const results = collectToolResults(options.messages, record.awaiting);
 				if (results.length === 0) throw new QoderError("qoder: resuming a paused turn but no matching tool results were supplied", "INVALID_REQUEST");
 				for (const result of results) record.awaiting.delete(result.id);
-				await client.sendCustomToolResults(record.sessionId, results, signal);
+				lastEventId = await client.sendCustomToolResults(record.sessionId, results, signal);
 			} else {
 				// A fresh user turn. First make sure the Session exposes dsh's *current*
 				// tool set (patched live, history intact), then send the newest user text.
@@ -928,11 +1137,31 @@ class QoderSessionAdapter {
 					await client.updateSessionTools(record.sessionId, sessionTools, signal);
 					record.toolSignature = signature;
 				}
-				const userText = extractUserText(options.messages);
+				// A cold Session has no server-side history, so carry the whole current
+				// turn; once the Session exists, the incremental newest-only path is right.
+				const userText = record.fresh ? extractTurnUserText(options.messages) : extractUserText(options.messages);
 				if (userText.length === 0) throw new QoderError("qoder: no user message text to send", "INVALID_REQUEST");
-				await client.sendUserMessage(record.sessionId, userText, signal);
+				// A cold Session only exists because this conversation has none yet:
+				// a different model was selected, the host restarted, or the previous
+				// Session was abandoned. Qoder keeps the history, so without a replay
+				// the model would silently forget every earlier turn. The transcript
+				// goes out as part of the same user message — a `user.message` always
+				// starts a turn, and `system.message` may only be the final event of a
+				// request, so a separate seeding event cannot be silent.
+				let messageText = userText;
+				if (record.fresh && connection.replayHistory) {
+					const replay = buildHistoryReplay(options.messages);
+					if (replay.length > 0) messageText = `${REPLAY_HEADER}\n${replay}\n\n${REPLAY_FOOTER}\n${userText}`;
+				}
+				lastEventId = await client.sendUserMessage(record.sessionId, messageText, signal);
+				record.fresh = false;
 			}
-			const turn = { pending: new Set(), prefix };
+			const streamResponse = await client.openStream(record.sessionId, signal, lastEventId);
+			if (!streamResponse.ok || streamResponse.body === null) {
+				const text = await streamResponse.text().catch(() => "");
+				throw httpError("qoder: failed to open event stream", streamResponse.status, text);
+			}
+			const turn = { pending: new Set(), prefix, byCustomName };
 			yield* this.#translate(streamResponse.body, signal, armIdle, turn, bridge);
 			// Remember whether we paused for local tool execution, and which calls are
 			// outstanding, so the next stream() call can forward their results.
@@ -944,6 +1173,14 @@ class QoderSessionAdapter {
 				record.awaiting = new Set();
 			}
 		} catch (error) {
+			// A turn cancelled from this side (the user pressed Stop, or the idle
+			// ceiling fired) keeps running in the cloud: nothing has told Qoder to
+			// stop it. It would then hold the Session and reject every following turn
+			// with 409 "session is busy with a previous turn", which is why stopping a
+			// turn used to break the whole conversation.
+			if (conversation !== void 0 && (options.signal?.aborted === true || idleFired)) {
+				await this.#interruptQuietly(client, conversation.sessionId);
+			}
 			if (options.signal?.aborted) throw new QoderError("qoder: request aborted", "ABORTED", { cause: error });
 			if (idleFired) throw new QoderError("qoder: event stream idle timeout", "TIMEOUT", { cause: error });
 			if (error instanceof QoderError) throw error;
@@ -987,7 +1224,7 @@ class QoderSessionAdapter {
 		}
 		const createdSession = await client.createSession(agentId, this.#environmentId, signal);
 		if (createdSession.effectiveContextWindow > 0) this.#effectiveWindows.set(modelId, createdSession.effectiveContextWindow);
-		const record = { sessionId: createdSession.sessionId, phase: "idle", awaiting: new Set(), toolSignature: signature };
+		const record = { sessionId: createdSession.sessionId, phase: "idle", awaiting: new Set(), toolSignature: signature, fresh: true };
 		if (key !== null) this.#sessions.set(key, record);
 		return record;
 	}
@@ -1022,7 +1259,7 @@ class QoderSessionAdapter {
 				const data = frame.data ?? {};
 				const callId = String(data.custom_tool_use_id ?? data.id ?? frame.id ?? "");
 				if (callId.length === 0) continue;
-				const dshName = fromCustomToolName(turn.prefix, data.name);
+				const dshName = turn.byCustomName?.get(String(data.name ?? "").toLowerCase()) ?? fromCustomToolName(turn.prefix, data.name);
 				const args = typeof data.input === "string" ? data.input : safeStringify(data.input ?? {});
 				turn.pending.add(callId);
 				yield { type: "block-start", index, blockType: "tool-call" };
