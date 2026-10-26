@@ -348,6 +348,16 @@ curl.exe -s "https://api.qoder.com/api/v1/cloud/models" -H "Authorization: Beare
 5.56，其中 `sandbox_runtime_credits` 4.66）。桥接模式每轮都会拉起云端沙箱，所以
 「免费模型」不等于零成本——模型费可能是 0，沙箱运行时间照扣。
 
+## 故障排查：`resuming a paused turn but no matching tool results were supplied`
+
+**已修复（2026-10-26）。** 上一个问题的变种：停止发生时，Session 正**暂停在本地工具调用**上
+（等 dsh 把工具结果回传）。下一条消息到来时，插件发现「该续跑但拿不到工具结果」，就直接报错，
+从此这个会话每次都是同一句错。
+
+现在会识别这种情形：把这条永远等不到的暂停标记为放弃、在云端 `user.interrupt` 掉、等它回到
+`idle`，再把新消息当作**全新一轮**发出去。同时本地 abort（点停止 / 5 分钟空闲上限）也会清掉
+记录的待续工具调用，从源头上避免下一次命中。回归测试：`test/test-abandoned-pause.mjs`。
+
 ## 仓库结构
 
 ```
@@ -359,6 +369,7 @@ curl.exe -s "https://api.qoder.com/api/v1/cloud/models" -H "Authorization: Beare
 ├─ install-plugin.ps1    # 安装到 dsh profile
 ├─ test/test-smoke.mjs   # 离线回归：伪造 Qoder HTTP 响应，跑完整一轮
 ├─ test/test-client.mjs  # 无头验证 client.js 的 slot 注册与凭据接线
+├─ test/test-abandoned-pause.mjs  # 冻结「暂停时被中止」的恢复路径
 └─ node_modules/         # 两个 MIT 依赖（见下）
 ```
 
@@ -367,6 +378,7 @@ curl.exe -s "https://api.qoder.com/api/v1/cloud/models" -H "Authorization: Beare
 ```powershell
 node test/test-smoke.mjs
 node test/test-client.mjs
+node test/test-abandoned-pause.mjs
 ```
 
 两个用例失败时都会返回非 0 退出码，可直接放进 CI。

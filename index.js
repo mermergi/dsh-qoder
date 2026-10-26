@@ -1120,16 +1120,27 @@ class QoderSessionAdapter {
 			// deadlocks — see openStream() for why Node's fetch cannot post while a
 			// same-origin response is still streaming.
 			let lastEventId;
-			if (record.phase === "awaiting") {
+			const toolResults = record.phase === "awaiting" ? collectToolResults(options.messages, record.awaiting) : [];
+			if (record.phase === "awaiting" && toolResults.length > 0) {
 				// dsh has just executed the pending local tools and re-called us with
 				// their results appended to history. Forward those results to the SAME
 				// paused Session (a `user.custom_tool_result`, NOT a fresh user message)
 				// so Qoder resumes the interrupted turn.
-				const results = collectToolResults(options.messages, record.awaiting);
-				if (results.length === 0) throw new QoderError("qoder: resuming a paused turn but no matching tool results were supplied", "INVALID_REQUEST");
-				for (const result of results) record.awaiting.delete(result.id);
-				lastEventId = await client.sendCustomToolResults(record.sessionId, results, signal);
+				for (const result of toolResults) record.awaiting.delete(result.id);
+				lastEventId = await client.sendCustomToolResults(record.sessionId, toolResults, signal);
 			} else {
+				if (record.phase === "awaiting") {
+					// The Session was paused on a bridged tool call, but dsh came back with
+					// a NEW user message instead of the tool results: that turn was
+					// abandoned (the user pressed Stop while the tool was pending). The
+					// paused turn can never be resumed — it would fail every later message
+					// with "resuming a paused turn but no matching tool results were
+					// supplied" — so release it in the cloud and start this message fresh.
+					record.phase = "idle";
+					record.awaiting = new Set();
+					await this.#interruptQuietly(client, record.sessionId);
+					await client.waitForIdle(record.sessionId, signal).catch(() => false);
+				}
 				// A fresh user turn. First make sure the Session exposes dsh's *current*
 				// tool set (patched live, history intact), then send the newest user text.
 				const signature = toolSetSignature(sessionTools);
@@ -1179,6 +1190,11 @@ class QoderSessionAdapter {
 			// with 409 "session is busy with a previous turn", which is why stopping a
 			// turn used to break the whole conversation.
 			if (conversation !== void 0 && (options.signal?.aborted === true || idleFired)) {
+				// Forget any tool call this turn was waiting on: its result can never
+				// arrive, and holding the pause would fail the next message with
+				// "resuming a paused turn but no matching tool results were supplied".
+				conversation.phase = "idle";
+				conversation.awaiting = new Set();
 				await this.#interruptQuietly(client, conversation.sessionId);
 			}
 			if (options.signal?.aborted) throw new QoderError("qoder: request aborted", "ABORTED", { cause: error });
