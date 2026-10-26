@@ -358,6 +358,20 @@ curl.exe -s "https://api.qoder.com/api/v1/cloud/models" -H "Authorization: Beare
 `idle`，再把新消息当作**全新一轮**发出去。同时本地 abort（点停止 / 5 分钟空闲上限）也会清掉
 记录的待续工具调用，从源头上避免下一次命中。回归测试：`test/test-abandoned-pause.mjs`。
 
+## 执行中途插入的指令（已修，2026-10-26）
+
+**症状**：agent 正在跑工具循环时，你打一行字插进去，模型完全不理，好像没收到。
+
+**原因**：dsh 会把中途输入 splice 到**下一步**的历史里，而对桥接模式来说下一步就是「把工具
+结果回传、续跑云端那一轮」的那次调用。旧实现只发 `user.custom_tool_result`，**从没把这条
+新消息发出去**——它既不在云端历史里，也不会被后续任何调用重发，等于静默丢掉。
+
+**修法**：续跑时把「最后一条 assistant 工具调用之后的所有 user 消息」一并带上，作为同一次
+POST 里的 `user.message`（排在工具结果之后）。Qoder 接受这种组合（实测：模型会照着这条中途
+指令改口），所以既不丢指令，也不用多开一轮。
+
+回归测试：`test/test-steering.mjs`。
+
 ## 仓库结构
 
 ```
@@ -370,6 +384,7 @@ curl.exe -s "https://api.qoder.com/api/v1/cloud/models" -H "Authorization: Beare
 ├─ test/test-smoke.mjs   # 离线回归：伪造 Qoder HTTP 响应，跑完整一轮
 ├─ test/test-client.mjs  # 无头验证 client.js 的 slot 注册与凭据接线
 ├─ test/test-abandoned-pause.mjs  # 冻结「暂停时被中止」的恢复路径
+├─ test/test-steering.mjs # 冻结「工具执行中插入的指令」的转发
 └─ node_modules/         # 两个 MIT 依赖（见下）
 ```
 
@@ -379,6 +394,7 @@ curl.exe -s "https://api.qoder.com/api/v1/cloud/models" -H "Authorization: Beare
 node test/test-smoke.mjs
 node test/test-client.mjs
 node test/test-abandoned-pause.mjs
+node test/test-steering.mjs
 ```
 
 两个用例失败时都会返回非 0 退出码，可直接放进 CI。

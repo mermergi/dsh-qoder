@@ -407,6 +407,39 @@ function collectToolResults(messages, awaiting) {
 }
 
 /**
+ * User text injected after the tool call that the Session is paused on.
+ *
+ * dsh splices a message typed mid-turn into the history of the *next* step, which
+ * for a bridged turn is the resume call — so these messages are new content that
+ * has not been forwarded anywhere, not a re-send of the turn's original prompt.
+ * Scanning forward from the last assistant tool-call block covers both orders dsh
+ * may use (before or after the tool results).
+ * @param messages - dsh message history for the resume call.
+ * @returns the injected user texts joined in order, or "" when none.
+ */
+function collectSteering(messages) {
+	if (!Array.isArray(messages)) return "";
+	let lastToolCall = -1;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index];
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		if (message.content.some((block) => block?.type === "tool-call")) {
+			lastToolCall = index;
+			break;
+		}
+	}
+	if (lastToolCall < 0) return "";
+	const texts = [];
+	for (let index = lastToolCall + 1; index < messages.length; index += 1) {
+		const message = messages[index];
+		if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+		const text = message.content.filter((block) => block?.type === "text" && typeof block.text === "string" && block.text.length > 0).map((block) => block.text).join("\n");
+		if (text.length > 0) texts.push(text);
+	}
+	return texts.join("\n\n");
+}
+
+/**
  * Map a tool-result payload onto Qoder `content` blocks. dsh result blocks are
  * primarily `{ type: "text", text }` (images carry an attachment reference that
  * the cloud sandbox cannot read here), so non-text payloads are serialised to
@@ -795,13 +828,31 @@ class QoderClient {
 	 * @param results - `{ id, blocks, isError }` items.
 	 * @param signal - cancellation.
 	 */
-	async sendCustomToolResults(sessionId, results, signal) {
+	/**
+	 * Resume a Session paused on `requires_action` by returning custom tool
+	 * results dsh produced locally. Each result references the originating
+	 * `agent.custom_tool_use` id, which is also the dsh tool-call id we surfaced.
+	 *
+	 * `steering` carries user text that arrived *while the tools were running*.
+	 * Qoder accepts a `user.message` in the same batch as the tool results (the
+	 * pair resumes the paused turn and steers it), and without it that instruction
+	 * would be silently dropped: dsh re-sends the whole history on the resume call,
+	 * but this adapter never forwarded anything except the tool results.
+	 * @param sessionId - the paused Session.
+	 * @param results - `{ id, blocks, isError }` items.
+	 * @param signal - cancellation.
+	 * @param steering - mid-turn user text to append after the results, if any.
+	 */
+	async sendCustomToolResults(sessionId, results, signal, steering = "") {
 		const events = results.map((result) => ({
 			type: "user.custom_tool_result",
 			custom_tool_use_id: result.id,
 			content: result.blocks,
 			is_error: result.isError === true
 		}));
+		if (typeof steering === "string" && steering.length > 0) {
+			events.push({ type: "user.message", content: [{ type: "text", text: steering }] });
+		}
 		const payload = await this.sendEvents(sessionId, events, signal);
 		return lastEventIdOf(payload);
 	}
@@ -1125,9 +1176,12 @@ class QoderSessionAdapter {
 				// dsh has just executed the pending local tools and re-called us with
 				// their results appended to history. Forward those results to the SAME
 				// paused Session (a `user.custom_tool_result`, NOT a fresh user message)
-				// so Qoder resumes the interrupted turn.
+				// so Qoder resumes the interrupted turn. Anything the user typed while
+				// the tools were running rides along as a `user.message`, or it would be
+				// dropped: this adapter forwards nothing but the results on a resume.
+				const steering = collectSteering(options.messages);
 				for (const result of toolResults) record.awaiting.delete(result.id);
-				lastEventId = await client.sendCustomToolResults(record.sessionId, toolResults, signal);
+				lastEventId = await client.sendCustomToolResults(record.sessionId, toolResults, signal, steering);
 			} else {
 				if (record.phase === "awaiting") {
 					// The Session was paused on a bridged tool call, but dsh came back with
