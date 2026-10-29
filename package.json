@@ -43,5 +43,12 @@
     "client.js",
     "cordis.patch.yml"
   ],
-  "license": "MIT"
+  "scripts": {
+    "test": "node test/test-smoke.mjs && node test/test-client.mjs && node test/test-abandoned-pause.mjs && node test/test-steering.mjs && node test/host-integration.mjs && node test/client-credits-smoke.mjs",
+    "test:live": "QODER_LIVE=1 node test/host-integration.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  }
 }

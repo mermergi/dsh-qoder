@@ -19,6 +19,13 @@
         # be one of that model's `available_context_windows`. 0 = keep the model default.
         # Bigger tiers cost more Qoder credits per turn.
         agentContextWindow: 0
+        # Default reasoning level for conversations that have not picked one.
+        # "" = the model catalog's own `default_effort`. Otherwise one of the levels
+        # that model advertises (`low` / `medium` / `high` / `xhigh` / `max`, plus
+        # `none` for models that support disabling reasoning). The model picker
+        # offers the same levels per model, and switching one keeps the cloud
+        # conversation (the Session's model is patched in place).
+        defaultReasoningEffort: ""
         maxTokens: 8192
         systemPrompt: ""
         environmentId: ""

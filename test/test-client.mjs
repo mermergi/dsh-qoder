@@ -17,9 +17,28 @@ const window = {
 	},
 };
 
-// --- stub react/jsx-runtime + UI primitives --------------------------------
+// --- stub react / react-dom / react/jsx-runtime + UI primitives ------------
 const jsx = (type, props) => ({ type, ...(props ?? {}) });
 const reactJsxRuntime = { jsx, jsxs: jsx };
+// The bundle now also owns the Session-header credit chip, which uses hooks and
+// a portal; a minimal React surface is enough to materialize and render it.
+const react = {
+	useState(initial) {
+		return [initial, () => {}];
+	},
+	useRef(initial) {
+		return { current: initial };
+	},
+	useEffect() {},
+	useMemo(factory) {
+		return factory();
+	},
+	useCallback(fn) {
+		return fn;
+	},
+	createElement: jsx,
+};
+const reactDom = { createPortal: (element) => element };
 
 function createSnapshotStore(initial) {
 	return {
@@ -68,9 +87,15 @@ const primitives = {
 	SettingsFormModel: FakeSettingsFormModel,
 	settingsTextField: (field) => ({ field }),
 	settingsNumberField: (field) => ({ field }),
+	Tooltip: (props) => props.children,
+	IconGaugeOutlineRegular: () => jsx("IconGauge"),
+	useAnchoredPosition: () => null,
+	useDismissOnOutsidePointer: () => {},
 };
 
 const require = (specifier) => {
+	if (specifier === "react") return react;
+	if (specifier === "react-dom") return reactDom;
 	if (specifier === "react/jsx-runtime") return reactJsxRuntime;
 	if (specifier === "@deepseek-ai/dsh-client-ui-primitives") return primitives;
 	throw new Error(`unexpected require: ${specifier}`);
@@ -85,6 +110,7 @@ const scope = {
 
 const credentialCalls = { describe: [], set: [] };
 let registeredSlot;
+let registeredChip;
 let whileServedCb;
 const ctx = {
 	locale: { bind: () => (key) => key, register: () => {} },
@@ -114,12 +140,13 @@ const ctx = {
 	},
 	slots: {
 		inject: (name, cb) => {
-			assert.equal(name, "settings.models.provider-card");
+			assert.ok(name === "settings.models.provider-card" || name === "conversation.session.header.utilities", `unexpected slot: ${name}`);
 			cb();
 			return () => {};
 		},
 		register: (options, component) => {
-			registeredSlot = { options, component };
+			if (options.name === "settings.models.provider-card") registeredSlot = { options, component };
+			if (options.name === "conversation.session.header.utilities") registeredChip = { options, component };
 			return () => {};
 		},
 	},
@@ -141,6 +168,12 @@ assert.equal(registeredSlot.options.name, "settings.models.provider-card");
 assert.equal(registeredSlot.options.key, "llm-qoder");
 assert.equal(registeredSlot.options.locale, "settings.qoder");
 
+// The Session-header seat carries the Qoder credit chip, keyed to no provider.
+assert.ok(registeredChip, "credit chip slot was not registered");
+assert.equal(registeredChip.options.name, "conversation.session.header.utilities");
+assert.equal(registeredChip.options.id, "qoder-credits");
+assert.equal(registeredChip.options.locale, "settings.qoder");
+
 // The credential is addressed by the reference the section names.
 await new Promise((resolve) => setImmediate(resolve));
 assert.deepEqual(credentialCalls.describe[0], ["QODER_API_KEY"]);
@@ -148,6 +181,7 @@ assert.deepEqual(credentialCalls.describe[0], ["QODER_API_KEY"]);
 // The injected face exposes the store hook + form actions.
 const face = registeredSlot.options.inject();
 assert.ok(face.hooks.qoderCard, "expected a qoderCard hook store");
+assert.equal(face.hooks.qoderCard.getSnapshot().defaultReasoningEffort.text, "", "defaultReasoningEffort missing from the form");
 for (const action of ["edit", "resetField", "save", "discard"]) assert.equal(typeof face[action], "function");
 
 // Rendering the card must not throw and must surface the configured badge.

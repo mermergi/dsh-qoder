@@ -10,8 +10,9 @@ Qoder 对外只提供了 **Cloud Agents** 这套有状态 API：
 ```
 Agent(模型+系统提示+工具) + Environment(云端沙箱) → Session
   → POST user.message
-  → 通过 SSE 读回 session.status_running / agent.thinking /
-     agent.message / agent.tool_use / agent.tool_result / session.status_idle
+  → 通过 SSE 读回 session.status_running / span.model_request_* /
+     agent.thinking / agent.message / agent.tool_use / agent.tool_result /
+     session.usage / session.status_idle
 ```
 
 而 dsh 的 `llm` provider 扩展点是一个**无状态的流式补全**契约（把完整历史 + dsh
@@ -20,7 +21,8 @@ Agent(模型+系统提示+工具) + Environment(云端沙箱) → Session
 本插件把两者桥接起来：
 
 - 一个 dsh 会话（`sessionId`）映射为一个**长期存在的 Qoder Session**，历史由
-  Qoder 服务端维护，插件每轮只发送最新的 user 消息。
+  Qoder 服务端维护，插件每轮只发送最新的 user 消息（两处例外：冷 Session 先补一段
+  历史转写，工具续跑时顺带转发中途插入的指令——见下文对应章节）。
 - **本地工具桥接（`bridgeLocalTools`，默认开启）**：dsh 自己的工具清单会被重新
   发布成 Qoder 的**客户端自定义工具**（加前缀避免与内置名冲突，如 `Read` →
   `dsh_Read`）。于是模型只做决策，**实际执行发生在你这台机器上**：
@@ -41,6 +43,20 @@ Agent(模型+系统提示+工具) + Environment(云端沙箱) → Session
 - 鉴权使用 **Personal Access Token (PAT)**，通过 dsh 的 `credentials` 服务
   （或启动环境变量）解析，并以 `Authorization: Bearer <PAT>` 发送——与 Qoder API
   要求一致。
+- **推理等级**：Qoder 模型目录里的 `efforts`（`none/low/medium/high/xhigh/max` 的子集）
+  会发布给 dsh 的模型选择器，于是选择器里像官方模型一样出现推理强度子菜单；选择结果
+  作为 Agent 的 `model.effort` 发送。切换模型或推理等级时，插件用
+  `POST /sessions/{id}` + `x-qoder-beta: session-agent-patch-2026-07-21` **原地修改
+  云端 Session**，不重建会话、不丢云端历史。
+- **积分**：目录里的 `price_factor` 会显示成模型列表里的倍率徽标（`0.5×`、`免费` 等）；
+  每轮 `span.model_request_end.model_usage.credits` 与会话累计 `session.usage` 汇总成
+  积分统计，由会话头部的积分徽标展示（数据经插件自己的 `/qoder/credits` 路由提供，
+  见「推理等级、积分倍率与积分统计」）。
+- **思考过程**：`agent.thinking` 会渲染成 dsh 的**推理块**。注意 Qoder Cloud Agents
+  **不公开推理正文**（官方文档原文：“agent.thinking never exposes reasoning
+  content”；实测 buffered 事件与 `event_deltas[]=agent.thinking` 都只有开始/结束标记），
+  所以块里展示的是本次思考的**推理强度与实际耗时**；若将来某个模型/区域开始携带正文，
+  插件会原样展示。
 
 ### 桥接的是哪些工具？
 
@@ -91,19 +107,26 @@ dsh 每次调用适配器时，`options.tools` 给的是**当前 agent 可见的
    `defaultModel`，在 dsh 里换模型不会生效）；而 Session 与 Agent 都按「会话 + 模型」
    缓存，中途换模型会开一个新的 Qoder Session。
 
-一个必须知道的不对称：桥接模式下每轮**只发送最新的 user 消息**，历史存在 Qoder 服务端。
+一个必须知道的不对称：桥接模式下每轮**只发送最新的 user 消息**（冷 Session / 工具续跑
+两个例外见下文），历史存在 Qoder 服务端。
 所以 dsh 自己的 compaction **无法真正缩短云端 Session**——它只减少 dsh 侧的记账，
 而 dsh 也看不到云端那份额外开销。两边都只朝一个方向安全：把 dsh 的 `contextWindow`
 报得**小于等于**云端真实窗口。若你看到 dsh 一直不压缩而 Qoder 开始丢早期上下文，
 就调低 `agentContextWindow` 或新开一个会话。
 
-#### 换了模型 / 重启之后，模型为什么「失忆」？（已修，2026-10-26）
+#### 换了模型 / 推理等级 / 重启之后，模型为什么「失忆」？（已修）
 
-Session 是按「会话 + 模型」缓存的，**换模型 = 新建云端 Session = 云端历史为空**；重启
-dsh 同理。原实现只发最新一条 user 消息，于是模型完全不记得前文。
+**换模型或推理等级不再丢历史（2026-10-29 起）**：Session 现在按「会话」缓存，模型与
+`effort` 属于运行期配置。切换时插件用 `POST /sessions/{id}`（带 beta 头
+`session-agent-patch-2026-07-21`）**原地 patch** 云端 Session 的 `agent.model`，
+历史原样保留。只有两种情况仍会新建 Session 并触发下面的历史回放：
 
-现在（`replayHistory`，默认 `true`）遇到**冷 Session** 时，会先从 dsh 自己的历史里
-拼一段转写（`user:` / `assistant:` 逐条，保留最近的、总共 ≤ 24k 字符，单条 ≤ 2.5k），
+1. **宿主重启**（内存里的 Session 映射丢失）；
+2. **云端拒绝这次原地切换**（例如该 Session 已不可更新）——插件会告警、中断旧 Session，
+   新建一个并立即回放转写。
+
+历史回放（`replayHistory`，默认 `true`）会先从 dsh 自己的历史里拼一段转写
+（`user:` / `assistant:` 逐条，保留最近的、总共 ≤ 24k 字符，单条 ≤ 2.5k），
 夹在本次 user 消息之前一起发出：
 
 ```
@@ -161,8 +184,9 @@ assistant: ……
    中」的提示且禁用保存。为此本插件自带一个浏览器包 **`client.js`**，它注册进模型页
    声明的 keyed 子插槽 `settings.models.provider-card`（`key = "llm-qoder"`），于是
    **Qoder 卡片上会直接内嵌一个配置表单**：一个 PAT 输入框（经 `credentials` 域写入
-   凭据引用 `QODER_API_KEY`，正是 `resolveToken` 读取的名字）+ 接口地址 + 默认模型，
-   点「保存」即生效，无需再打开任何文件。
+   凭据引用 `QODER_API_KEY`，正是 `resolveToken` 读取的名字）+ 接口地址 + 默认模型 +
+   **默认推理强度**，点「保存」即生效，无需再打开任何文件。同一个浏览器包还在**会话
+   头部**挂了一个 **Qoder 积分徽标**（见下一节）。
 
 > `client.js` 通过 package.json 的 `dsh.client`（`platform: web`）+ `exports["./client"]`
 > 被宿主 `ClientModuleRegistry` 发现并作为 `/plugins` 资源提供。**新增该声明后需要完全
@@ -173,7 +197,70 @@ assistant: ……
 > 本插件把 `@deepseek-ai/schemastery`（及其唯一运行时依赖 `@deepseek-ai/cosmokit`）
 > **vendor 到了自身的 `node_modules/`** 下，从而能构建真实 `Config`。宿主侧仍不依赖任何
 > `@deepseek-ai` 服务包（通过 `ctx` 服务与鸭子类型的适配器接入）；`client.js` 仅在浏览器
-> 侧 `require` 应用已有的 `react/jsx-runtime` 与 `@deepseek-ai/dsh-client-ui-primitives`。
+> 侧 `require` 应用已有的 `react/jsx-runtime` / `react-dom` 与
+> `@deepseek-ai/dsh-client-ui-primitives`。
+
+### 推理等级、积分倍率与积分统计
+
+**1. 模型列表里的积分倍率**
+
+`GET /api/v1/cloud/models` 给每个模型带一个 `price_factor`（相对基准价的积分倍率）。
+插件把它发布成 dsh 模型选择器里的**徽标**：`0.5×` / `0.8×` / `1×` / `1.25×`，免费模型
+（`price_factor = 0`，如促销期的 Flash）显示为 **免费 / Free**；大于 1 的倍率用警告色。
+同一个值也会写进模型的 `description`，在会显示描述的界面（如设置页模型列表）可见。
+
+**2. 推理等级（effort）**
+
+每个模型的 `efforts` 数组就是它接受的推理等级（`none` / `low` / `medium` / `high` /
+`xhigh` / `max` 的子集），`default_effort` 是缺省值。插件把这份信息按「从低到高」发布给
+dsh，模型选择器里就会出现和官方模型一致的**推理强度子菜单**：
+
+- 只列该模型真实支持的等级（例如 `dmodel` 只有 high/max），并按
+  `EFFORT_ORDER` 排序——Qoder 目录里的顺序是乱的；
+- `support_disable_reasoning: true` 的模型（如 `dfmodel`）额外提供 `None`（关闭思考）；
+- 选择结果随请求下发为 Agent 的 `model.effort`；未选择时用目录的 `default_effort`
+  （可用 `defaultReasoningEffort` 覆盖）；
+- **切换模型或等级不会丢云端历史**：插件 patch 现有 Session 的 `agent.model`
+  （beta 头 `session-agent-patch-2026-07-21`），这是 Qoder 文档里的「动态更新运行时配置」。
+  只有 patch 被拒（极端情况）才退回「新建 Session + 历史回放」。
+
+**3. 积分消耗统计（会话头部徽标）**
+
+Qoder 在两处给出积分：单次模型调用 `span.model_request_end.model_usage.credits`，以及
+每个 idle 前的会话累计 `session.usage`（`model_credits` / `sandbox_runtime_credits` /
+`total_credits`）。插件把两者汇总后，由 `client.js` 在**会话头部右侧**显示一个积分徽标
+（如 `0.56`），点开面板可见：
+
+| 行 | 含义 |
+| --- | --- |
+| 本轮 | 当前 dsh 轮次内所有模型调用（含工具往返后的续跑）的 span 积分之和 + 请求次数 |
+| 本会话累计 | Qoder `session.usage` 的权威累计值；展开可见「模型调用 / 云端沙箱」明细 |
+| 本次运行累计 | 本次 dsh 进程启动以来的全部会话积分之和 |
+| 模型 / 推理强度 / 推理倍率 | 当前会话最近一轮实际使用的路由信息，倍率为目录 `price_factor` |
+
+实现要点：
+
+- 数据通道是插件自己注册的 Host 路由 `GET /qoder/credits?sessionId=<dsh session id>`，
+  JSON 结构见 `test/host-integration.mjs`。浏览器端每 2.5 秒轮询一次（仅页面可见时），
+  取不到路由（例如 Electron 外壳没有 `webServer`）就整块不渲染。
+- `session.usage` 是**快照，不是增量**：插件整体替换，绝不重复累加（重复累加会把长期
+  会话的积分算成几倍）。沙箱费用可能在 idle 之后才结算，下一轮 idle 前才进快照，所以
+  显示的数字可能略滞后于控制台。
+- 若会话因 patch 被拒而换了新的云端 Session，旧 Session 的累计值会被**结转**到
+  「本会话累计」上，同一次运行内数字不会倒退（宿主重启后统计从零开始，见下条）。
+- 积分是 Qoder 侧计费事实，dsh 自己的 token 计量（消息下方的「本轮用量」）与此独立：
+  Qoder Cloud Agents 不返回 token 数，只返回积分。
+- 统计只保存在插件进程内存里；重启 dsh 后从下一轮开始重新累计（云端 Session 本身也
+  因重启而重建）。历史会话不会回填旧数字。
+
+**4. 思考过程**
+
+`agent.thinking` 被转成 dsh 的 `reasoning` 块，因此对话里会出现「思考过程」折叠行。
+Qoder Cloud Agents **不公开推理正文**（官方文档明写 `agent.thinking never exposes
+reasoning content`；实测 buffered 事件和 `event_deltas[]=agent.thinking` 都只有阶段
+标记），所以块里写的是**推理强度 + 实际思考耗时**，并注明正文未公开。若未来某模型/区域
+开始返回正文（`content` / `thinking` / `reasoning` / `text` 任一字段），插件会原样展示，
+不需要再改代码。
 
 ## 前置条件：拿到 Qoder PAT
 
@@ -247,6 +334,7 @@ refs:
 | `defaultModel` | `ultimate` | 新建 Agent 使用的模型 id；以该区域 `GET /api/v1/cloud/models` 为准（中国区无 `ultimate`，如 `dmodel`/`qmodel_38max`/`auto`） |
 | `contextWindow` | `0` | 上报给 dsh 的上下文窗口；`0` = 按 Qoder 模型目录的真实窗口（受 `max_input_tokens` 封顶） |
 | `agentContextWindow` | `0` | 发给 Qoder 的 `model.context_window` 档位（必须 ∈ 该模型的 `available_context_windows`）；`0` = 用模型默认。档位越大每轮积分越多 |
+| `defaultReasoningEffort` | 空 | 会话未显式选择推理等级时使用的默认等级；留空 = 用模型目录的 `default_effort`。必须是该模型 `efforts` 里的值（`none` 仅在支持关闭思考的模型上提供）。也可以在模型选择器里逐会话改 |
 | `maxTokens` | `8192` | 上报给 dsh 的默认 max tokens |
 | `tlsMaxVersion` | `TLSv1.2` | 允许协商的最大 TLS 版本；部分网络会重置 TLS1.3 握手导致 `transport failed`，保持 1.2 即可 |
 | `systemPrompt` | 空 | Qoder Agent 的系统提示 |
@@ -256,21 +344,24 @@ refs:
 | `bridgeLocalTools` | `true` | 把 dsh 的本地工具发布为 Qoder 自定义工具，由 dsh 在**本机**执行 |
 | `cloudTools` | `DeliverArtifacts` | 桥接时仍保留的 Qoder 内置工具。**不要**加入 `Read/Write/Edit/Bash/Glob/Grep`，否则模型会读云端沙箱而不是你的磁盘；留空则退化为仅 `DeliverArtifacts` |
 | `localToolPrefix` | `dsh_` | 桥接工具名前缀（Qoder 禁止 custom 工具与内置重名），回传 dsh 时会自动去掉 |
-| `replayHistory` | `true` | 冷 Session（换模型 / 重启后）先把 dsh 侧历史转写灌进去，避免模型「失忆」。冷启动那轮输入 token 会变多 |
+| `replayHistory` | `true` | 冷 Session（宿主重启 / 原地切换被拒后）先把 dsh 侧历史转写灌进去，避免模型「失忆」。冷启动那轮输入 token 会变多。换模型/等级本身已改为原地 patch，不再需要回放 |
 
 ## 已知限制（重要）
 
 1. 桥接模式下工具确实在**本机**执行，但每一轮都要**多一次网络往返**（暂停→本地执行
-   →回传→续跑），所以比纯聊天慢，且每轮都消耗 Qoder 积分。
-2. 每轮**只转发最新的 user 消息**，多轮上下文依赖 Qoder Session 服务端记忆。若
+   →回传→续跑），所以比纯聊天慢，且每轮都消耗 Qoder 积分。思考过程只保留在**当前
+   会话**的对话记录里；插件**不会**把积分/思考元数据回放给云端，历史回放只含正文。
+2. 每轮**只转发最新的 user 消息**（冷 Session 与工具续跑例外，见上文），多轮上下文
+   依赖 Qoder Session 服务端记忆。若
    dsh 会话没有稳定 `sessionId`，则每次调用会新建一个 Session（无法跨轮记忆）。副作用：
    dsh 侧的 compaction 只能缩小 dsh 自己的记账，**不会缩短云端 Session**（详见
    「上下文长度是谁定的？」）。
 3. Qoder 返回的是**整段** `agent.message`（非逐 token 增量），插件将其作为单个
    文本块输出。
-4. `agent.thinking` 与 `agent.tool_result` 不上屏；`agent.tool_use`（模型擅自调用云
-   端内置工具）会以一行说明文字呈现，避免整轮静默空白；`agent.thread_context_compacted`
-   （云端自己压缩了历史）同样会明说。
+4. `agent.thinking` 会上屏为**推理块**，但 Qoder 只给阶段标记、不给推理正文，所以块里
+   是「推理强度 + 耗时 + 正文未公开」的说明（见上文第 4 点）。`agent.tool_result`（云端
+   工具输出）不上屏；`agent.tool_use`（模型擅自调用云端内置工具）会以一行说明文字呈现，
+   避免整轮静默空白；`agent.thread_context_compacted`（云端自己压缩了历史）同样会明说。
 5. 端点必须与**账号区域**一致：全球区用 `https://api.qoder.com`，中国区用
    `https://api.qoder.com.cn`。用错区域会返回 `401 TOKEN_INVALID`
    （`invalid pt-token`），即使令牌本身有效；各区域可用模型 id 也不同（中国区没有
@@ -376,28 +467,36 @@ POST 里的 `user.message`（排在工具结果之后）。Qoder 接受这种组
 
 ```
 .
-├─ index.js              # 服务端适配器（LLM provider + 本地工具桥接）
-├─ client.js             # 浏览器侧：在「设置 → 模型」里注入配置表单
-├─ package.json          # 插件清单（dsh.bundle.patch / dsh.client.inject）
-├─ cordis.patch.yml      # 默认配置（baseURL / defaultModel 等）
-├─ install-plugin.ps1    # 安装到 dsh profile
-├─ test/test-smoke.mjs   # 离线回归：伪造 Qoder HTTP 响应，跑完整一轮
-├─ test/test-client.mjs  # 无头验证 client.js 的 slot 注册与凭据接线
-├─ test/test-abandoned-pause.mjs  # 冻结「暂停时被中止」的恢复路径
-├─ test/test-steering.mjs # 冻结「工具执行中插入的指令」的转发
-└─ node_modules/         # 两个 MIT 依赖（见下）
+├─ index.js                        # 服务端适配器（LLM provider + 本地工具桥接 + 积分统计路由）
+├─ client.js                       # 浏览器侧：模型页配置表单 + 会话头部积分徽标
+├─ package.json                    # 插件清单（dsh.bundle.patch / dsh.client.inject）
+├─ cordis.patch.yml                # 默认配置（baseURL / defaultModel / defaultReasoningEffort 等）
+├─ install-plugin.ps1              # 安装到 dsh profile
+├─ test/test-smoke.mjs             # 离线：伪造 Qoder HTTP 响应，跑完整一轮
+├─ test/test-client.mjs            # 无头：client.js 的 slot 注册与凭据接线
+├─ test/test-abandoned-pause.mjs   # 冻结「暂停时被中止」的恢复路径
+├─ test/test-steering.mjs          # 冻结「工具执行中插入的指令」的转发
+├─ test/host-integration.mjs       # 离线：推理等级 / 积分 / 思考 / 原地 patch / 统计路由
+│                                  #       QODER_LIVE=1 时再跑真实 API 的一轮（需要 PAT）
+├─ test/client-credits-smoke.mjs   # 离线：用 React 桩渲染积分徽标 / 面板 / 表单字段
+└─ node_modules/                   # 两个 MIT 依赖（见下）
 ```
 
 自测（不需要网络，也不需要真 PAT）：
 
-```powershell
+```bash
 node test/test-smoke.mjs
 node test/test-client.mjs
 node test/test-abandoned-pause.mjs
 node test/test-steering.mjs
+node test/host-integration.mjs
+node test/client-credits-smoke.mjs
+
+# 真实账号冒烟（读 ~/.dsh/.credentials.yaml 里的 QODER_API_KEY，会消耗极少量积分）
+QODER_LIVE=1 node test/host-integration.mjs
 ```
 
-两个用例失败时都会返回非 0 退出码，可直接放进 CI。
+任一用例失败都会返回非 0 退出码，可直接放进 CI。
 
 ### 为何 `node_modules/` 会进仓库
 

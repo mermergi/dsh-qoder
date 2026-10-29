@@ -320,8 +320,10 @@ const ok =
 	patchOk &&
 	text === "Hello from Qoder!" &&
 	finish?.reason?.kind === "stop" &&
-	chunks.filter((c) => c.type === "block-start").length === 1 &&
-	chunks.filter((c) => c.type === "block-end").length === 1 &&
+	chunks.filter((c) => c.type === "block-start").length === 2 &&
+	chunks.filter((c) => c.type === "block-end").length === 2 &&
+	chunks.some((c) => c.type === "block-end" && c.block.type === "reasoning") &&
+	chunks.some((c) => c.type === "reasoning-delta" && /Thinking phase/.test(c.text)) &&
 	turnStarted &&
 	reused &&
 	bearer;

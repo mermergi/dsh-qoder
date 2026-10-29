@@ -114,6 +114,61 @@ const QODER_MAX_TOOL_ENTRIES = 128;
  */
 const DEFAULT_CONTEXT_WINDOW = 200000;
 /**
+ * Qoder's reasoning-effort vocabulary, ordered from least to greatest. The
+ * model catalog advertises a per-model subset in `efforts` (in no dependable
+ * order), and the Agent accepts it as `model.effort`; dsh's model picker wants
+ * the selectable levels ordered least→greatest, so everything is ranked here.
+ */
+const EFFORT_ORDER = ["none", "low", "medium", "high", "xhigh", "max"];
+/**
+ * Display metadata for each effort level. These names are provider strings, the
+ * same way `llm-deepseek` labels its own levels, so the picker reads them
+ * identically regardless of UI language.
+ */
+const EFFORT_INFO = {
+	none: {
+		name: "None",
+		description: "Disable the reasoning phase; answer directly."
+	},
+	low: {
+		name: "Low",
+		description: "Fast, light reasoning for routine tasks."
+	},
+	medium: {
+		name: "Medium",
+		description: "Balanced reasoning for everyday work."
+	},
+	high: {
+		name: "High",
+		description: "Deeper reasoning for complex tasks."
+	},
+	xhigh: {
+		name: "X-High",
+		description: "Extra reasoning depth for hard problems."
+	},
+	max: {
+		name: "Max",
+		description: "Maximum reasoning effort; slowest and most expensive."
+	}
+};
+/**
+ * Beta header Qoder requires before a live Session's `agent.model` may be
+ * changed. Patching the Session keeps its server-side history, so switching the
+ * model or reasoning level no longer starts a new cloud conversation.
+ */
+const SESSION_AGENT_PATCH_BETA = "session-agent-patch-2026-07-21";
+/**
+ * Exact HTTP route the plugin's browser half reads for credit statistics.
+ *
+ * Why a plugin-owned route: credits are runtime facts produced inside a turn
+ * (`span.model_request_end.model_usage.credits` and `session.usage`), not
+ * settings and not session events, so the Web UI has no built-in way to read
+ * them. `ctx.get('webServer')` is the Host's own route service; the browser half
+ * requests the same origin it was served from. The path deliberately avoids
+ * `/api` (the RPC channel) and `/plugins` (client bundles).
+ */
+const CREDIT_STATS_ROUTE = "/qoder/credits";
+/**
  * Appended to the Agent's system prompt while local-tool bridging is on.
  *
  * Without it the model happily calls a *built-in* tool, reads the equivalent path
@@ -144,6 +199,11 @@ const Config = z.object({
 	// `available_context_windows`; an unavailable value is dropped with a warning.
 	// Larger tiers cost more Qoder credits per turn.
 	agentContextWindow: z.number().default(0),
+	// Default reasoning effort materialised into requests when a conversation has
+	// not picked one ("" = whichever `default_effort` the model catalog states).
+	// It must be a level that model advertises in its `efforts` array; an
+	// unsupported value is simply not offered for that model.
+	defaultReasoningEffort: z.string().default(""),
 	maxTokens: z.number().default(8192),
 	tlsMaxVersion: z.string().default("TLSv1.2"),
 	systemPrompt: z.string().default(""),
@@ -242,6 +302,7 @@ function resolveConnection(config, env = readProcessEnv) {
 		defaultModel: str(pick(config, "defaultModel"), "ultimate"),
 		contextWindow: positiveInt(pick(config, "contextWindow"), 0),
 		agentContextWindow: positiveInt(pick(config, "agentContextWindow"), 0),
+		defaultReasoningEffort: str(pick(config, "defaultReasoningEffort"), "").trim().toLowerCase(),
 		maxTokens: positiveInt(pick(config, "maxTokens"), 8192),
 		systemPrompt: str(pick(config, "systemPrompt"), ""),
 		environmentId: str(pick(config, "environmentId"), "").trim(),
@@ -579,24 +640,40 @@ function effectiveContextWindow(connection, entry, learned = 0) {
 }
 
 /**
- * The `model` value for Agent creation: a bare id unless a context tier was
- * chosen, in which case Qoder expects the object form `{ id, context_window }`.
- * A tier the model does not list in `available_context_windows` is dropped (with
- * a warning) instead of sent, so the session keeps a window that actually exists.
+ * The `model` value for Agent creation or a Session runtime patch.
+ *
+ * Qoder accepts either a bare model id or the object form
+ * `{ id, effort, context_window }`. An effort the catalog does not list for this
+ * model is dropped (with a warning) instead of sent, exactly like an
+ * unavailable context tier, so a stale pick cannot fail the whole turn. When
+ * discovery failed and nothing is known about the model, the requested effort
+ * is sent anyway: Qoder validates it and its 400 names the problem.
  * @param model - Qoder model id.
  * @param entry - catalog entry for the model, when discovery succeeded.
  * @param tier - configured `agentContextWindow` (0 = keep the model default).
- * @param warn - sink for the dropped-tier notice.
+ * @param effort - requested reasoning level, or undefined for the model default.
+ * @param warn - sink for a dropped value's notice.
  * @returns a Qoder Agent `model` value.
  */
-function agentModelSpec(model, entry, tier, warn) {
-	if (!(tier > 0)) return model;
-	const allowed = entry?.availableContextWindows ?? [];
-	if (allowed.length > 0 && !allowed.includes(tier)) {
-		warn(`qoder: context window ${tier} is not offered for model "${model}" (available: ${allowed.join(", ") || "none reported"}); keeping the model default`);
-		return model;
+function agentModelSpec(model, entry, tier, effort, warn) {
+	const spec = { id: model };
+	let tuned = false;
+	if (typeof effort === "string" && effort.length > 0 && EFFORT_INFO[effort] !== void 0) {
+		const allowed = effortIdsForModel(entry);
+		if (allowed.length === 0 || allowed.includes(effort)) {
+			spec.effort = effort;
+			tuned = true;
+		} else warn(`qoder: reasoning effort "${effort}" is not offered for model "${model}" (available: ${allowed.join(", ")}); keeping the model default`);
 	}
-	return { id: model, context_window: tier };
+	if (tier > 0) {
+		const allowed = entry?.availableContextWindows ?? [];
+		if (allowed.length > 0 && !allowed.includes(tier)) warn(`qoder: context window ${tier} is not offered for model "${model}" (available: ${allowed.join(", ") || "none reported"}); keeping the model default`);
+		else {
+			spec.context_window = tier;
+			tuned = true;
+		}
+	}
+	return tuned ? spec : model;
 }
 
 /** Stable signature of a tool set, used to decide when a session needs re-patching. */
@@ -705,19 +782,30 @@ class QoderClient {
 		return created.id;
 	}
 	/**
-	 * Replace a live Session's tool configuration without disturbing its history.
-	 * Used when dsh's offered tool set changes between turns so the model sees the
-	 * current capabilities. `tools` is a complete replacement (per Qoder docs).
+	 * Patch a live Session's runtime configuration without replacing it or
+	 * disturbing its server-side history.
+	 *
+	 * `agent.tools` is a complete replacement; `agent.model` switches the model
+	 * and its reasoning level in place. Qoder gates the model field behind the
+	 * `session-agent-patch-2026-07-21` beta header, so it is only sent when the
+	 * patch touches the model. The response echoes the Session and is the source
+	 * of the runtime-resolved `effective_context_window`.
 	 * @param sessionId - the Session to patch.
-	 * @param sessionTools - the full desired tool array.
+	 * @param patch - `{ tools?, model? }` subset of `agent`.
 	 * @param signal - cancellation.
+	 * @returns `{ effectiveContextWindow }` from the updated Session (0 when absent).
 	 */
-	async updateSessionTools(sessionId, sessionTools, signal) {
-		await this.json(`${CLOUD_API}/sessions/${encodeURIComponent(sessionId)}`, {
+	async updateSessionRuntime(sessionId, patch, signal) {
+		const headers = { "content-type": "application/json" };
+		if (patch.model !== void 0) headers["x-qoder-beta"] = SESSION_AGENT_PATCH_BETA;
+		const updated = await this.json(`${CLOUD_API}/sessions/${encodeURIComponent(sessionId)}`, {
 			method: "POST",
-			"headers": { "content-type": "application/json" },
-			body: JSON.stringify({ agent: { tools: sessionTools } })
+			headers,
+			body: JSON.stringify({ agent: patch })
 		}, signal);
+		return {
+			effectiveContextWindow: positiveInt(updated?.agent?.model?.effective_context_window, 0)
+		};
 	}
 	/**
 	 * Create a Session and report both its id and the context window the runtime
@@ -939,11 +1027,144 @@ function normalizeModelList(json) {
 			// the tiers that may be sent as `model.context_window`.
 			maxInputTokens: positiveInt(item?.max_input_tokens, 0),
 			defaultContextWindow: positiveInt(item?.default_context_window, 0),
-			availableContextWindows: Array.isArray(item?.available_context_windows) ? item.available_context_windows.filter((value) => Number.isInteger(value) && value > 0) : []
+			availableContextWindows: Array.isArray(item?.available_context_windows) ? item.available_context_windows.filter((value) => Number.isInteger(value) && value > 0) : [],
+			// Selection facts the model picker shows:
+			// `price_factor` is the Credit rate relative to the account's base rate,
+			// `efforts`/`default_effort` are the reasoning levels the model accepts as
+			// `model.effort`, and `support_disable_reasoning` says whether `none` may be
+			// sent even when the upstream list omits it.
+			priceFactor: creditRateOf(item?.price_factor),
+			efforts: effortIdsOf(item?.efforts),
+			defaultEffort: effortIdOf(item?.default_effort),
+			supportDisableReasoning: item?.support_disable_reasoning === true
 		});
 	}
 	return out;
 }
+
+//#region catalog facts (credits and reasoning levels)
+/**
+ * Read a Qoder Credit rate (`price_factor`). The catalog reports it as a plain
+ * number, where 0 means the model is currently free and 1 is the account's
+ * base rate; anything else (a string, a negative number, NaN) is treated as
+ * unknown rather than as a rate, because a wrong multiplier misleads more than
+ * a missing one.
+ * @param value - raw `price_factor` from the catalog.
+ * @returns the rate, or undefined when the catalog did not state a usable one.
+ */
+function creditRateOf(value) {
+	const rate = typeof value === "string" && value.trim().length > 0 ? Number(value) : value;
+	return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 ? rate : void 0;
+}
+/**
+ * Coerce one catalog effort id into the provider's vocabulary.
+ * @param value - raw id.
+ * @returns the id when Qoder offers it, otherwise undefined.
+ */
+function effortIdOf(value) {
+	return typeof value === "string" && EFFORT_INFO[value] !== void 0 ? value : void 0;
+}
+/**
+ * Deduplicate and validate a catalog `efforts` array.
+ * @param values - raw ids from the catalog.
+ * @returns known ids in catalog order.
+ */
+function effortIdsOf(values) {
+	if (!Array.isArray(values)) return [];
+	const out = [];
+	for (const value of values) {
+		const id = effortIdOf(value);
+		if (id !== void 0 && !out.includes(id)) out.push(id);
+	}
+	return out;
+}
+/**
+ * The levels a model may actually be asked for, least→greatest.
+ *
+ * `support_disable_reasoning: true` adds `none` even when the upstream list
+ * omits it — verified against the live API: such models accept `effort: "none"`
+ * and the level is absent from `efforts` only because reasoning is on by
+ * default. A model that does not support disabling reasoning only exposes the
+ * listed levels.
+ * @param model - catalog entry.
+ * @returns ordered effort ids, possibly empty when the model has no levels.
+ */
+function effortIdsForModel(model) {
+	const ids = effortIdsOf(model?.efforts);
+	if (model?.supportDisableReasoning === true && !ids.includes("none")) ids.push("none");
+	return ids.sort((left, right) => EFFORT_ORDER.indexOf(left) - EFFORT_ORDER.indexOf(right));
+}
+/**
+ * Render a Credit rate the way the picker's badge shows it.
+ *
+ * The badge is the only per-model label the model selector renders next to a
+ * name, so the rate lives there. `0` is shown as a localized "free" because a
+ * bare `0×` reads as broken; `>1` uses the warning tone because those models
+ * cost more than the account's base rate.
+ * @param factor - catalog `price_factor`.
+ * @returns a dsh model badge, or undefined when the catalog stated no rate.
+ */
+function priceFactorBadge(factor) {
+	if (factor === void 0) return void 0;
+	if (factor === 0) return {
+		text: {
+			zh: "免费",
+			en: "Free"
+		},
+		tone: "success"
+	};
+	return {
+		text: `${formatFactor(factor)}×`,
+		tone: factor > 1 ? "warning" : factor < 1 ? "info" : "neutral"
+	};
+}
+/**
+ * Format a Credit rate without trailing zeroes: 0.5, 0.8, 1, 1.25.
+ * @param value - finite non-negative number.
+ * @returns display text.
+ */
+function formatFactor(value) {
+	return String(Math.round(value * 100) / 100);
+}
+/**
+ * One-line catalog description for a model: the levels it accepts and its
+ * Credit rate. The model selector itself renders only the badge; this text is
+ * for surfaces that show a description (e.g. Settings → Models).
+ * @param model - catalog entry.
+ * @returns description text, or undefined when the catalog stated neither fact.
+ */
+function modelDescription(model) {
+	const parts = [];
+	const efforts = effortIdsForModel(model);
+	if (efforts.length > 0) parts.push(`Reasoning: ${efforts.map((id) => EFFORT_INFO[id].name.toLowerCase()).join(" / ")}`);
+	if (model?.priceFactor !== void 0) parts.push(`Credit rate: ${formatFactor(model.priceFactor)}×`);
+	return parts.length > 0 ? parts.join(" · ") : void 0;
+}
+/**
+ * Build dsh's selectable-reasoning metadata for one exact model route.
+ *
+ * dsh materialises `defaultEffort` into every request that omits one, validates
+ * a requested effort against this list, and the model picker renders the list
+ * least→greatest. `none` is only advertised when the model accepts it.
+ * @param model - catalog entry for the model.
+ * @param configured - `defaultReasoningEffort` from the plugin config, if any.
+ * @returns reasoning metadata, or undefined when the model exposes no levels.
+ */
+function reasoningInfoFor(model, configured) {
+	const efforts = effortIdsForModel(model);
+	if (efforts.length === 0) return void 0;
+	const wanted = typeof configured === "string" ? configured.trim().toLowerCase() : "";
+	const defaultEffort = wanted.length > 0 && efforts.includes(wanted) ? wanted : typeof model?.defaultEffort === "string" && efforts.includes(model.defaultEffort) ? model.defaultEffort : void 0;
+	return {
+		efforts: efforts.map((id) => ({
+			id,
+			...EFFORT_INFO[id]
+		})),
+		...defaultEffort === void 0 ? {} : { defaultEffort }
+	};
+}
+//#endregion
+
 //#endregion
 
 //#region SSE parsing
@@ -1000,15 +1221,256 @@ function parseFrame(rawFrame) {
 }
 //#endregion
 
+//#region credit statistics
+/**
+ * Round one Credit figure the way Qoder reports it (two decimal places, floored
+ * upstream). Summing the per-request figures locally must not accumulate binary
+ * float noise into numbers the UI shows next to Qoder's own totals.
+ * @param value - arbitrary number.
+ * @returns a finite non-negative amount, or 0 for junk.
+ */
+function creditNumber(value) {
+	const number = typeof value === "string" && value.trim().length > 0 ? Number(value) : value;
+	return typeof number === "number" && Number.isFinite(number) && number >= 0 ? Math.round(number * 100) / 100 : 0;
+}
+/** Add two Credit amounts without float drift. */
+function addCredits(left, right) {
+	return Math.round((creditNumber(left) + creditNumber(right)) * 100) / 100;
+}
+/**
+ * Cumulative and per-turn Qoder Credit accounting for the provider.
+ *
+ * Two Qoder facts feed it, both carried by the Session event stream:
+ * - `span.model_request_end.model_usage.credits` — the exact Credits of one model
+ *   call, which is what makes a per-turn figure possible;
+ * - `session.usage` — the Session's cumulative snapshot (`model_credits`,
+ *   `sandbox_runtime_credits`, `total_credits`), emitted before each idle.
+ * The snapshot REPLACES the previous one rather than adding up; only per-call
+ * spans are summed. A conversation that has to switch to a fresh cloud Session
+ * (model patch refused, host restart) carries the completed Session's total
+ * forward so the user-visible conversation total keeps growing monotonically.
+ */
+class QoderCreditStats {
+	/** dsh session id -> record; kept only for this host process lifetime. */
+	#sessions = new Map();
+	/** Credits billed across every conversation since this host started. */
+	#lifetimeCredits = 0;
+	#lifetimeCalls = 0;
+	#record(sessionId) {
+		if (typeof sessionId !== "string" || sessionId.length === 0) return void 0;
+		let record = this.#sessions.get(sessionId);
+		if (record === void 0) {
+			record = {
+				sessionId,
+				model: null,
+				modelName: null,
+				effort: null,
+				priceFactor: null,
+				turnIndex: 0,
+				turnCredits: 0,
+				turnCalls: 0,
+				lastCallCredits: 0,
+				usage: null,
+				carriedCredits: 0,
+				updatedAt: 0
+			};
+			this.#sessions.set(sessionId, record);
+		}
+		return record;
+	}
+	/**
+	 * Open a new conversation turn: reset the per-turn counters and record which
+	 * model/level the turn is actually billed against.
+	 * @param sessionId - dsh conversation key.
+	 * @param facts - model id, display name, effort, and catalog Credit rate.
+	 */
+	startTurn(sessionId, facts = {}) {
+		const record = this.#record(sessionId);
+		if (record === void 0) return;
+		record.turnIndex += 1;
+		record.turnCredits = 0;
+		record.turnCalls = 0;
+		record.lastCallCredits = 0;
+		if (facts.model !== void 0) record.model = facts.model;
+		if (facts.modelName !== void 0) record.modelName = facts.modelName;
+		if (facts.effort !== void 0) record.effort = facts.effort;
+		if (facts.priceFactor !== void 0) record.priceFactor = facts.priceFactor;
+		record.updatedAt = Date.now();
+	}
+	/**
+	 * Account one completed model call.
+	 * @param sessionId - dsh conversation key.
+	 * @param credits - `model_usage.credits` from `span.model_request_end`.
+	 */
+	noteCall(sessionId, credits) {
+		const record = this.#record(sessionId);
+		if (record === void 0) return;
+		const amount = creditNumber(credits);
+		record.turnCredits = addCredits(record.turnCredits, amount);
+		record.turnCalls += 1;
+		record.lastCallCredits = amount;
+		record.updatedAt = Date.now();
+		this.#lifetimeCredits = addCredits(this.#lifetimeCredits, amount);
+		this.#lifetimeCalls += 1;
+	}
+	/**
+	 * Replace the Session's cumulative snapshot with the freshly emitted one.
+	 * @param sessionId - dsh conversation key.
+	 * @param usage - the `session.usage` event's three Credit fields.
+	 */
+	applyUsage(sessionId, usage) {
+		const record = this.#record(sessionId);
+		if (record === void 0) return;
+		record.usage = {
+			modelCredits: creditNumber(usage?.modelCredits),
+			sandboxCredits: creditNumber(usage?.sandboxCredits),
+			totalCredits: creditNumber(usage?.totalCredits)
+		};
+		record.updatedAt = Date.now();
+	}
+	/**
+	 * A real cloud Session is being replaced by a fresh one for the same dsh
+	 * conversation: carry its completed total forward and start the new Session's
+	 * snapshot from zero, so "本次会话累计" never goes backwards.
+	 * @param sessionId - dsh conversation key.
+	 */
+	rotateCloudSession(sessionId) {
+		const record = this.#record(sessionId);
+		if (record === void 0) return;
+		record.carriedCredits = addCredits(record.carriedCredits, record.usage?.totalCredits ?? 0);
+		record.usage = null;
+		record.updatedAt = Date.now();
+	}
+	/** Forget every conversation record (config reload); lifetime totals survive. */
+	reset() {
+		this.#sessions.clear();
+	}
+	/**
+	 * The wire snapshot the browser half renders (see CREDIT_STATS_ROUTE).
+	 * @param sessionId - dsh conversation key from the request query.
+	 * @returns the v1 statistics payload; `known` is false until a turn began.
+	 */
+	snapshot(sessionId) {
+		const lifetime = {
+			credits: creditNumber(this.#lifetimeCredits),
+			calls: this.#lifetimeCalls
+		};
+		const record = typeof sessionId === "string" ? this.#sessions.get(sessionId) : void 0;
+		if (record === void 0) return {
+			ok: true,
+			known: false,
+			sessionId: typeof sessionId === "string" && sessionId.length > 0 ? sessionId : null,
+			model: null,
+			modelName: null,
+			effort: null,
+			priceFactor: null,
+			turn: {
+				index: 0,
+				credits: 0,
+				calls: 0,
+				lastCallCredits: 0
+			},
+			session: {
+				modelCredits: 0,
+				sandboxCredits: 0,
+				totalCredits: 0,
+				carriedCredits: 0,
+				total: 0
+			},
+			lifetime,
+			updatedAt: 0
+		};
+		const usage = record.usage ?? {
+			modelCredits: 0,
+			sandboxCredits: 0,
+			totalCredits: 0
+		};
+		return {
+			ok: true,
+			known: record.updatedAt > 0,
+			sessionId: record.sessionId,
+			model: record.model,
+			modelName: record.modelName,
+			effort: record.effort,
+			priceFactor: record.priceFactor,
+			turn: {
+				index: record.turnIndex,
+				credits: creditNumber(record.turnCredits),
+				calls: record.turnCalls,
+				lastCallCredits: creditNumber(record.lastCallCredits)
+			},
+			session: {
+				modelCredits: usage.modelCredits,
+				sandboxCredits: usage.sandboxCredits,
+				totalCredits: usage.totalCredits,
+				carriedCredits: record.carriedCredits,
+				total: addCredits(record.carriedCredits, usage.totalCredits)
+			},
+			lifetime,
+			updatedAt: record.updatedAt
+		};
+	}
+}
+/**
+ * Answer the browser half's statistics request.
+ *
+ * Reads only; never throws (a rejected read would surface as a broken page for
+ * every session). The route is registered on the Host's loopback Web server, so
+ * it is reachable only from the page that same server serves.
+ * @param req - inbound request (GET/HEAD).
+ * @param res - response; this function owns it.
+ * @param stats - live statistics store.
+ */
+function serveCreditStats(req, res, stats) {
+	try {
+		if (req.method !== "GET" && req.method !== "HEAD") {
+			res.writeHead(405, {
+				"content-type": "application/json; charset=utf-8",
+				"allow": "GET, HEAD",
+				"cache-control": "no-store"
+			});
+			res.end(JSON.stringify({ ok: false, error: "method not allowed" }));
+			return;
+		}
+		let sessionId = null;
+		try {
+			sessionId = new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("sessionId");
+		} catch {
+			sessionId = null;
+		}
+		const payload = stats.snapshot(sessionId);
+		res.writeHead(200, {
+			"content-type": "application/json; charset=utf-8",
+			"cache-control": "no-store",
+			"x-content-type-options": "nosniff"
+		});
+		if (req.method === "HEAD") {
+			res.end();
+			return;
+		}
+		res.end(JSON.stringify(payload));
+	} catch (error) {
+		try {
+			res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+			res.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
+		} catch {
+			/* the response is already gone; nothing useful left to do */
+		}
+	}
+}
+//#endregion
+
 /**
  * The Qoder provider adapter. Duck-typed against the `llm` seam's requirements:
  * `providerInfo`, `providerRetryPolicy`, `listModels`, `resolveModel`,
- * `prepareCall`, and `stream`. Owns one Qoder Session per conversation *and*
- * selected model, since a Session is bound to the Agent that backs it.
+ * `prepareCall`, and `stream`. Owns one Qoder Session per conversation; a model
+ * or reasoning-level change patches that Session in place (see
+ * #reconcileConversation), and only a refused patch falls back to a new Session.
  */
 class QoderSessionAdapter {
 	#connection;
 	#resolveToken;
+	#stats;
 	/** conversation key -> per-conversation Qoder session record (see #ensureConversation) */
 	#sessions = new Map();
 	/** `${model-spec}\0${tool-signature}` -> cached agent id; environment cached separately */
@@ -1017,16 +1479,18 @@ class QoderSessionAdapter {
 	#catalog = new Map();
 	/** model id -> the `effective_context_window` a live Session reported for it */
 	#effectiveWindows = new Map();
+
 	/** in-flight catalog read, so concurrent resolutions share one request */
 	#discovery;
 	/** whether a catalog has been attempted since the last `reset()` */
 	#catalogAttempted = false;
 	#warn;
 	#environmentId;
-	constructor(connection, resolveToken, warn = () => {}) {
+	constructor(connection, resolveToken, warn = () => {}, stats = new QoderCreditStats()) {
 		this.#connection = connection;
 		this.#resolveToken = resolveToken;
 		this.#warn = warn;
+		this.#stats = stats;
 	}
 	providerInfo(provider) {
 		return { id: provider, name: this.#connection().displayName };
@@ -1082,18 +1546,43 @@ class QoderSessionAdapter {
 		// path always refetches instead of reusing a previous (failed) read.
 		this.#catalogAttempted = false;
 		let discovered = await this.#ensureCatalog();
-		if (!discovered.some((model) => model.id === connection.defaultModel)) discovered = [{ id: connection.defaultModel, name: titleCase(connection.defaultModel), maxInputTokens: 0, defaultContextWindow: 0, availableContextWindows: [] }, ...discovered];
-		return discovered.map((model) => ({ provider, id: model.id, name: model.name }));
+		if (!discovered.some((model) => model.id === connection.defaultModel)) discovered = [{
+			id: connection.defaultModel,
+			name: titleCase(connection.defaultModel),
+			maxInputTokens: 0,
+			defaultContextWindow: 0,
+			availableContextWindows: [],
+			priceFactor: void 0,
+			efforts: [],
+			defaultEffort: void 0,
+			supportDisableReasoning: false
+		}, ...discovered];
+		return discovered.map((model) => {
+			// The selector shows one provider-authored badge per model. Qoder's Credit
+			// rate (`price_factor`) is the per-model fact users cannot otherwise see,
+			// and a free model is worth flagging as a benefit rather than "0×".
+			const badge = priceFactorBadge(model.priceFactor);
+			const description = modelDescription(model);
+			return {
+				provider,
+				id: model.id,
+				name: model.name,
+				...description === void 0 ? {} : { description },
+				...badge === void 0 ? {} : { badge }
+			};
+		});
 	}
 	async resolveModel(provider, model, _signal) {
 		const connection = this.#connection();
 		const entry = await this.#catalogEntry(model);
+		const reasoning = reasoningInfoFor(entry, connection.defaultReasoningEffort);
 		return {
 			provider,
 			id: model,
 			name: entry?.name ?? titleCase(model),
 			context: { contextWindow: effectiveContextWindow(connection, entry, this.#effectiveWindows.get(model) ?? 0) },
-			defaultMaxTokens: connection.maxTokens
+			defaultMaxTokens: connection.maxTokens,
+			...reasoning === void 0 ? {} : { reasoning }
 		};
 	}
 	async prepareCall(provider, model, signal) {
@@ -1143,9 +1632,13 @@ class QoderSessionAdapter {
 		if (process.env.QODER_DEBUG) console.error(`[qoder-dbg] model=${model} bridge=${bridge} prefix=${JSON.stringify(prefix)} tools_in=${options.tools?.length ?? "undefined"} session=${JSON.stringify(sessionTools.map((t) => t.name ?? t.type))}`);
 		const token = await this.#resolveToken();
 		const client = new QoderClient(connection, token);
-		// The Agent bakes in both the model and its context-window tier, so resolve
-		// those before provisioning the conversation.
-		const modelSpec = agentModelSpec(model, await this.#catalogEntry(model), connection.agentContextWindow, this.#warn);
+		// The Agent bakes in the model, its reasoning level, and its context-window
+		// tier, so resolve all three before provisioning the conversation. The level
+		// comes from the caller (the model picker's effort submenu); when a model
+		// declares a default, dsh has already materialised it here.
+		const entry = await this.#catalogEntry(model);
+		const effort = str(options.reasoningEffort, "");
+		const modelSpec = agentModelSpec(model, entry, connection.agentContextWindow, effort, this.#warn);
 
 		// A single cancellable lifecycle for the whole turn.
 		const controller = new AbortController();
@@ -1163,7 +1656,7 @@ class QoderSessionAdapter {
 		/** Set once the conversation exists, so the failure path can release the cloud turn. */
 		let conversation;
 		try {
-			const record = await this.#ensureConversation(client, options.sessionId, modelSpec, sessionTools, bridge, signal);
+			let record = await this.#ensureConversation(client, options.sessionId, modelSpec, sessionTools, bridge, signal);
 			conversation = record;
 			// Trigger the turn first and subscribe second, using the posted event's id
 			// as the stream's `Last-Event-ID` cursor: the stream then replays every
@@ -1172,6 +1665,16 @@ class QoderSessionAdapter {
 			// same-origin response is still streaming.
 			let lastEventId;
 			const toolResults = record.phase === "awaiting" ? collectToolResults(options.messages, record.awaiting) : [];
+			// A new conversation turn — as opposed to the resume call that follows local
+			// tool execution — is the unit the credit panel reports. Auxiliary model
+			// calls (session title, compaction) do not open a user-visible turn.
+			const continuingTurn = record.phase === "awaiting" && toolResults.length > 0;
+			if (!continuingTurn && options.purpose === void 0) this.#stats.startTurn(options.sessionId, {
+				model,
+				modelName: entry?.name,
+				effort: effort.length > 0 ? effort : entry?.defaultEffort,
+				priceFactor: entry?.priceFactor
+			});
 			if (record.phase === "awaiting" && toolResults.length > 0) {
 				// dsh has just executed the pending local tools and re-called us with
 				// their results appended to history. Forward those results to the SAME
@@ -1195,13 +1698,12 @@ class QoderSessionAdapter {
 					await this.#interruptQuietly(client, record.sessionId);
 					await client.waitForIdle(record.sessionId, signal).catch(() => false);
 				}
-				// A fresh user turn. First make sure the Session exposes dsh's *current*
-				// tool set (patched live, history intact), then send the newest user text.
-				const signature = toolSetSignature(sessionTools);
-				if (signature !== record.toolSignature) {
-					await client.updateSessionTools(record.sessionId, sessionTools, signal);
-					record.toolSignature = signature;
-				}
+				// A fresh user turn. Re-resolve the conversation record now that any
+				// abandoned pause has been released: a model or reasoning-level change
+				// the user made while that pause was pending is applied here, in place,
+				// so the message is sent to the Session the picker currently shows.
+				record = await this.#ensureConversation(client, options.sessionId, modelSpec, sessionTools, bridge, signal);
+				conversation = record;
 				// A cold Session has no server-side history, so carry the whole current
 				// turn; once the Session exists, the incremental newest-only path is right.
 				const userText = record.fresh ? extractTurnUserText(options.messages) : extractUserText(options.messages);
@@ -1226,7 +1728,15 @@ class QoderSessionAdapter {
 				const text = await streamResponse.text().catch(() => "");
 				throw httpError("qoder: failed to open event stream", streamResponse.status, text);
 			}
-			const turn = { pending: new Set(), prefix, byCustomName };
+			const turn = {
+				pending: new Set(),
+				prefix,
+				byCustomName,
+				stats: this.#stats,
+				sessionId: options.sessionId,
+				effort: effort.length > 0 ? effort : entry?.defaultEffort,
+				requestStartedAt: 0
+			};
 			yield* this.#translate(streamResponse.body, signal, armIdle, turn, bridge);
 			// Remember whether we paused for local tool execution, and which calls are
 			// outstanding, so the next stream() call can forward their results.
@@ -1274,29 +1784,110 @@ class QoderSessionAdapter {
 	 * @returns the live conversation record.
 	 */
 	async #ensureConversation(client, conversationId, modelSpec, sessionTools, bridge, signal) {
-		const modelId = typeof modelSpec === "string" ? modelSpec : modelSpec.id;
-		// A Qoder Session belongs to one Agent, so switching models mid-conversation
-		// cannot reuse it: key the cache by conversation *and* model.
-		const key = conversationId === void 0 || conversationId === null ? null : `${conversationId}\u0000${modelId}`;
+		// One cloud Session per dsh conversation: the model and reasoning level are
+		// runtime settings now (patched in place), not part of the cache key.
+		const key = conversationId === void 0 || conversationId === null ? null : String(conversationId);
 		if (key !== null) {
 			const cached = this.#sessions.get(key);
-			if (cached !== void 0) return cached;
+			if (cached !== void 0) {
+				// A Session paused on a local tool call is mid-turn: switching its model
+				// or tools underneath the paused turn would corrupt that turn, so the
+				// caller reconciles after it releases the pause (see stream()).
+				if (cached.phase !== "idle") return cached;
+				const reconciled = await this.#reconcileConversation(cached, client, modelSpec, sessionTools, signal);
+				return reconciled === void 0 ? await this.#createConversation(key, client, modelSpec, sessionTools, bridge, signal) : reconciled;
+			}
 		}
+		return await this.#createConversation(key, client, modelSpec, sessionTools, bridge, signal);
+	}
+	/**
+	 * Create a fresh cloud Session (and the Agent backing it) for one conversation.
+	 * @param key - dsh conversation key, or null for an ephemeral call.
+	 * @param client - request-scoped Qoder client.
+	 * @param modelSpec - Qoder model id, or `{ id, effort, context_window }`.
+	 * @param sessionTools - the full tool array for this conversation.
+	 * @param bridge - whether local-tool bridging is active.
+	 * @param signal - cancellation.
+	 * @returns the live conversation record, marked `fresh` for history replay.
+	 */
+	async #createConversation(key, client, modelSpec, sessionTools, bridge, signal) {
 		if (this.#environmentId === void 0) this.#environmentId = await client.ensureEnvironment(signal);
-		// An Agent's tools are baked in at creation, so cache by model + tool set;
-		// a changed tool list yields a fresh Agent rather than a stale snapshot.
+		// An Agent's tools, model, and reasoning level are baked in at creation, so
+		// cache by model spec + tool set; a changed value yields a fresh Agent
+		// rather than a stale snapshot.
 		const signature = toolSetSignature(sessionTools);
-		const agentKey = `${JSON.stringify(modelSpec)}\u0000${signature}`;
+		const modelKey = JSON.stringify(modelSpec);
+		const agentKey = `${modelKey}\u0000${signature}`;
 		let agentId = this.#agents.get(agentKey);
 		if (agentId === void 0) {
 			agentId = await client.ensureAgent(modelSpec, sessionTools, bridge, signal);
 			this.#agents.set(agentKey, agentId);
 		}
 		const createdSession = await client.createSession(agentId, this.#environmentId, signal);
+		const modelId = typeof modelSpec === "string" ? modelSpec : modelSpec.id;
 		if (createdSession.effectiveContextWindow > 0) this.#effectiveWindows.set(modelId, createdSession.effectiveContextWindow);
-		const record = { sessionId: createdSession.sessionId, phase: "idle", awaiting: new Set(), toolSignature: signature, fresh: true };
+		const record = {
+			key,
+			conversationId: key,
+			sessionId: createdSession.sessionId,
+			phase: "idle",
+			awaiting: new Set(),
+			toolSignature: signature,
+			modelKey,
+			fresh: true
+		};
 		if (key !== null) this.#sessions.set(key, record);
 		return record;
+	}
+	/**
+	 * Bring an idle cloud Session's runtime configuration up to date in place.
+	 *
+	 * Qoder's Session update endpoint replaces `agent.tools` and, behind the
+	 * `session-agent-patch-2026-07-21` beta header, `agent.model` — the latter
+	 * carries both the model id and its reasoning level. Because the Session is
+	 * patched rather than replaced, changing the model or effort in the picker no
+	 * longer wipes the cloud conversation (previous behaviour: new Session plus a
+	 * 24k-character replay on the next turn).
+	 *
+	 * A tools-only refusal stays fatal: the model would otherwise call tools it
+	 * was never given. A model/effort refusal falls back to a fresh Session, which
+	 * is the one path where trading history for a working turn is right — and the
+	 * cold-Session replay immediately restores the transcript.
+	 * @param record - live idle conversation record.
+	 * @param client - request-scoped Qoder client.
+	 * @param modelSpec - desired Qoder model value.
+	 * @param sessionTools - desired complete tool array.
+	 * @param signal - cancellation.
+	 * @returns the record when it stays in use, or undefined after it was released.
+	 */
+	async #reconcileConversation(record, client, modelSpec, sessionTools, signal) {
+		const modelKey = JSON.stringify(modelSpec);
+		const signature = toolSetSignature(sessionTools);
+		const patch = {};
+		if (signature !== record.toolSignature) patch.tools = sessionTools;
+		if (modelKey !== record.modelKey) patch.model = modelSpec;
+		if (patch.tools === void 0 && patch.model === void 0) return record;
+		try {
+			const updated = await client.updateSessionRuntime(record.sessionId, patch, signal);
+			record.toolSignature = signature;
+			record.modelKey = modelKey;
+			const modelId = typeof modelSpec === "string" ? modelSpec : modelSpec.id;
+			if (updated.effectiveContextWindow > 0) this.#effectiveWindows.set(modelId, updated.effectiveContextWindow);
+			return record;
+		} catch (error) {
+			if (patch.model === void 0) throw error;
+			const modelId = typeof modelSpec === "string" ? modelSpec : modelSpec.id;
+			this.#warn(`qoder: could not switch this conversation's cloud session to ${modelId} in place (${error?.message ?? error}); starting a fresh cloud session and replaying the transcript`);
+			// Carry this Session's credits onto the conversation's running total and
+			// release it so a paused or busy turn cannot pin it.
+			this.#stats.rotateCloudSession(record.conversationId);
+			record.phase = "idle";
+			record.awaiting = new Set();
+			if (record.key !== null) this.#sessions.delete(record.key);
+			await this.#interruptQuietly(client, record.sessionId);
+			await client.waitForIdle(record.sessionId, signal).catch(() => false);
+			return void 0;
+		}
 	}
 	/** Map Qoder events onto the dsh chunk protocol until the turn settles. */
 	async *#translate(body, signal, armIdle, turn, bridge) {
@@ -1311,6 +1902,48 @@ class QoderSessionAdapter {
 			if (type === "session.error") {
 				const message = frame.data?.error?.message ?? frame.data?.message ?? "unknown Qoder session error";
 				throw new QoderError(`qoder: session error: ${String(message)}`, "PROVIDER_ERROR");
+			}
+			if (type === "span.model_request_start") {
+				turn.requestStartedAt = timestampOf(frame.data?.processed_at);
+				continue;
+			}
+			if (type === "span.model_request_end") {
+				// The only exact per-request Credit figure Qoder exposes. Summing these
+				// over a turn is what the credit panel's "本轮" row reports; the
+				// Session's cumulative snapshot arrives separately as `session.usage`.
+				// A missing `model_usage` (credits unavailable) is not a zero-cost call,
+				// so only a stated figure counts; a genuine 0 (free model) still counts
+				// as one request.
+				const credits = Number(frame.data?.model_usage?.credits);
+				if (Number.isFinite(credits)) turn.stats.noteCall(turn.sessionId, credits);
+				continue;
+			}
+			if (type === "session.usage") {
+				// Cumulative Session snapshot: replaces the previous values, never added.
+				turn.stats.applyUsage(turn.sessionId, {
+					modelCredits: frame.data?.model_credits,
+					sandboxCredits: frame.data?.sandbox_runtime_credits,
+					totalCredits: frame.data?.total_credits
+				});
+				continue;
+			}
+			if (type === "agent.thinking") {
+				// Qoder publishes the thinking PHASE but not its text: the API documents
+				// that "agent.thinking never exposes reasoning content", and the live API
+				// (buffered events and `event_deltas[]=agent.thinking` alike) was verified
+				// to match. Surface the phase as dsh's reasoning block anyway — the
+				// selected level and how long the model thought are real facts the
+				// transcript should show — and pass through any reasoning text a payload
+				// ever does carry.
+				const text = thinkingTextOf(frame.data);
+				const summary = text.length > 0 ? text : thinkingSummaryOf(turn, frame.data);
+				if (summary.length > 0) {
+					yield { type: "block-start", index, blockType: "reasoning" };
+					yield { type: "reasoning-delta", index, text: summary };
+					yield { type: "block-end", index, block: { type: "reasoning", text: summary } };
+					index += 1;
+				}
+				continue;
 			}
 			if (type === "agent.message") {
 				for (const block of textBlocks(frame.data?.content)) {
@@ -1399,9 +2032,9 @@ class QoderSessionAdapter {
 				yield { type: "finish", reason: { kind } };
 				return;
 			}
-			// agent.thinking and agent.tool_result carry no dsh-side equivalent here:
-			// the former is Qoder-internal reasoning, the latter is a *cloud* tool's
+			// agent.tool_result carries no dsh-side equivalent: it is a *cloud* tool's
 			// output, which the user did not ask to run and cannot inspect locally.
+			// agent.thinking is translated above into a reasoning block.
 		}
 		if (bridge && turn.pending.size > 0) {
 			yield { type: "finish", reason: { kind: "tool-calls" } };
@@ -1415,6 +2048,54 @@ class QoderSessionAdapter {
 function textBlocks(content) {
 	if (!Array.isArray(content)) return [];
 	return content.filter((block) => block?.type === "text" && typeof block.text === "string" && block.text.length > 0).map((block) => block.text);
+}
+/**
+ * Extract reasoning text from an `agent.thinking` payload.
+ *
+ * The public API sends a contentless marker today, but the shape is read
+ * defensively: a provider/region that starts including text under `content`,
+ * `thinking`, `reasoning`, or `text` is rendered verbatim instead of dropped.
+ * @param data - the thinking event's payload.
+ * @returns reasoning text, or "" when the payload carries none.
+ */
+function thinkingTextOf(data) {
+	for (const key of ["thinking", "reasoning", "text"]) {
+		if (typeof data?.[key] === "string" && data[key].length > 0) return data[key];
+	}
+	if (!Array.isArray(data?.content)) return "";
+	return data.content.filter((block) => typeof block?.text === "string" && block.text.length > 0).map((block) => block.text).join("\n");
+}
+/**
+ * Describe one thinking phase when the provider withholds its text.
+ *
+ * dsh's reasoning block is the transcript's own "thinking process" row, so
+ * putting the phase there keeps the display honest: it names the level that was
+ * requested and how long the phase took, and says plainly that the reasoning
+ * text itself is not public.
+ * @param turn - per-turn stream context (request start, effort).
+ * @param data - the thinking event's payload.
+ * @returns one-line phase summary.
+ */
+function thinkingSummaryOf(turn, data) {
+	const startedAt = turn.requestStartedAt;
+	const finishedAt = timestampOf(data?.processed_at);
+	const seconds = startedAt > 0 && finishedAt > startedAt ? Math.round((finishedAt - startedAt) / 100) / 10 : 0;
+	const effort = typeof turn.effort === "string" && turn.effort.length > 0 ? turn.effort : "";
+	const label = effort.length > 0 ? EFFORT_INFO[effort]?.name ?? effort : "";
+	const facts = ["Thinking phase"];
+	if (seconds > 0) facts.push(`${seconds}s`);
+	if (label.length > 0) facts.push(`effort ${label}`);
+	return `${facts.join(" · ")} (Qoder Cloud Agents does not publish the reasoning text).`;
+}
+/**
+ * Parse an RFC 3339 timestamp from a public Qoder event.
+ * @param value - `processed_at` value.
+ * @returns epoch milliseconds, or 0 when absent/unparsable.
+ */
+function timestampOf(value) {
+	if (typeof value !== "string" || value.length === 0) return 0;
+	const ms = Date.parse(value);
+	return Number.isFinite(ms) ? ms : 0;
 }
 function titleCase(value) {
 	return String(value).replace(/[_-]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
@@ -1501,6 +2182,12 @@ function apply(ctx, config) {
 		throw new QoderError(`qoder: no access token for provider route "${PROVIDER}"; enter it in Settings \u2192 Models, or export ${refs[0]} in the launching environment`, "MISSING_CREDENTIAL");
 	};
 
+	// One statistics store for the whole provider: the adapter writes per-call
+	// Credits into it and the browser half reads it back over the plugin's own
+	// route. It lives on this fiber, so the effect that registers the route is
+	// disposed with the plugin.
+	const stats = new QoderCreditStats();
+
 	try {
 		if (ctx.llm?.registerConfigurableProviders) {
 			ctx.llm.registerConfigurableProviders([{
@@ -1517,7 +2204,7 @@ function apply(ctx, config) {
 		const adapter = new QoderSessionAdapter(() => resolveConnection(config), resolveToken, (message) => {
 			trace(message);
 			ctx.logger?.warn?.(message);
-		});
+		}, stats);
 		const registration = ctx.llm.registerAdapter([PROVIDER], adapter);
 		trace("registerAdapter() ok");
 		if (registration?.replace !== void 0) {
@@ -1526,6 +2213,19 @@ function apply(ctx, config) {
 				registration.replace([PROVIDER]);
 			});
 		}
+		// Credit statistics are not settings and not session events, so the Web
+		// client cannot read them through an existing RPC namespace. The Host's own
+		// Web server is the intended plugin seam (`ctx.inject(['webServer'])`, the
+		// same way client bundles are served); when the deployment has none (e.g.
+		// the Electron shell) the route simply never appears and the browser half
+		// renders nothing.
+		ctx.inject(["webServer"], (webCtx) => {
+			webCtx.effect(() => webCtx.webServer.register({
+				kind: "exact",
+				path: CREDIT_STATS_ROUTE,
+				handler: (req, res) => serveCreditStats(req, res, stats)
+			}), "qoder: credit statistics route");
+		});
 		trace("apply() completed successfully");
 	} catch (error) {
 		trace(`apply() FAILED: ${error?.stack ?? error?.message ?? error}`);
@@ -1533,4 +2233,28 @@ function apply(ctx, config) {
 	}
 }
 
-export { apply, Config, inject, name };
+/**
+ * Internals exported for the repository's offline tests. Not part of the plugin
+ * contract: the harness only consumes `apply`, `Config`, `inject`, and `name`.
+ */
+const __test = {
+	QoderError,
+	QoderCreditStats,
+	QoderSessionAdapter,
+	agentModelSpec,
+	creditNumber,
+	creditRateOf,
+	effortIdsForModel,
+	formatFactor,
+	modelDescription,
+	normalizeModelList,
+	priceFactorBadge,
+	reasoningInfoFor,
+	serveCreditStats,
+	thinkingTextOf,
+	thinkingSummaryOf,
+	EFFORT_INFO,
+	EFFORT_ORDER
+};
+
+export { apply, Config, inject, name, __test };
