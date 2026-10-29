@@ -392,7 +392,6 @@ for (const key of [
   "credits.model",
   "credits.effort",
   "credits.priceFactor",
-  "credits.free",
   "credits.empty"
 ]) {
   assert.ok(key in zhDictionary, `missing zh key ${key}`);
@@ -474,7 +473,7 @@ assert.equal(formatCredits(null), "\u2014");
 assert.equal(formatCredits("2.50"), "2.5");
 assert.equal(formatPriceFactor(0.5, t), "0.5×");
 assert.equal(formatPriceFactor(1, t), "1×");
-assert.equal(formatPriceFactor(0, t), "免费");
+assert.equal(formatPriceFactor(0, t), "0×");
 assert.equal(formatPriceFactor(null, t), "\u2014");
 console.log("formatCredits/formatPriceFactor OK");
 
@@ -568,8 +567,9 @@ const freePanel = serialize(jsxRuntimeStub.jsx(CreditsPanel, {
   }),
   t
 }));
-assert.ok(freePanel.includes("免费"), "priceFactor 0 should read as 免费");
-assert.ok(freePanel.includes("暂无数据"), "zero/absent figures should read as 暂无数据");
+assert.ok(freePanel.includes("0×"), "priceFactor 0 should read as the literal 0× rate");
+assert.ok(freePanel.includes("暂无数据"), "absent model/effort reads as no data");
+assert.ok(freePanel.includes("本轮"), "a reported zero is still shown as a row");
 assert.ok(freePanel.includes("\u2014"), "absent effort should read as an em dash");
 console.log("panel empty/free states OK");
 

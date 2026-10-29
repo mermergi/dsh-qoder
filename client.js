@@ -63,7 +63,6 @@ window.__ModuleLoader__.load({
 			"credits.model": "Model",
 			"credits.effort": "Reasoning effort",
 			"credits.priceFactor": "Credit multiplier",
-			"credits.free": "Free",
 			"credits.empty": "No data"
 		};
 		const zh = {
@@ -96,7 +95,6 @@ window.__ModuleLoader__.load({
 			"credits.model": "模型",
 			"credits.effort": "推理强度",
 			"credits.priceFactor": "积分倍率",
-			"credits.free": "免费",
 			"credits.empty": "暂无数据"
 		};
 		/**
@@ -317,7 +315,9 @@ window.__ModuleLoader__.load({
 		function formatPriceFactor(value, t) {
 			const number = typeof value === "number" ? value : value === null || value === undefined ? Number.NaN : Number(value);
 			if (!Number.isFinite(number)) return EM_DASH;
-			if (number === 0) return t("credits.free");
+			// A 0 rate is a reference rate, not proof that the model is free: Cloud
+			// Agents also bills sandbox runtime, and the catalog rate can trail the
+			// actual charge. Show the literal rate and let the Credits rows speak.
 			return `${formatCredits(number)}\u00d7`;
 		}
 		/**
@@ -407,7 +407,9 @@ window.__ModuleLoader__.load({
 			const empty = t("credits.empty");
 			// "No data" rather than a misleading 0 while the Host has not recorded
 			// a figure yet; priceFactor 0 has its own truthful "free" wording.
-			const amount = (value) => typeof value === "number" && Number.isFinite(value) && value !== 0 ? formatCredits(value) : empty;
+			// A reported 0 is a real figure (nothing billed yet or nothing to bill), so
+			// it reads "0"; only an absent value reads "no data".
+			const amount = (value) => typeof value === "number" && Number.isFinite(value) ? formatCredits(value) : empty;
 			const model = stats.modelName ?? stats.model;
 			return (0, react_jsx_runtime.jsxs)("div", {
 				ref: panelRef,

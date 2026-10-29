@@ -69,10 +69,7 @@ ok("effort lists are validated, ordered least→greatest, and gain none only whe
 });
 
 ok("price-factor badge fits dsh's catalog constraints", () => {
-	const free = priceFactorBadge(0);
-	assert.equal(free.text.zh, "免费");
-	assert.equal(free.text.en, "Free");
-	assert.equal(free.tone, "success");
+	assert.deepEqual(priceFactorBadge(0), { text: "0×", tone: "info" });
 	assert.deepEqual(priceFactorBadge(0.5), { text: "0.5×", tone: "info" });
 	assert.deepEqual(priceFactorBadge(1), { text: "1×", tone: "neutral" });
 	assert.deepEqual(priceFactorBadge(1.25), { text: "1.25×", tone: "warning" });

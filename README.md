@@ -48,7 +48,7 @@ Agent(模型+系统提示+工具) + Environment(云端沙箱) → Session
   作为 Agent 的 `model.effort` 发送。切换模型或推理等级时，插件用
   `POST /sessions/{id}` + `x-qoder-beta: session-agent-patch-2026-07-21` **原地修改
   云端 Session**，不重建会话、不丢云端历史。
-- **积分**：目录里的 `price_factor` 会显示成模型列表里的倍率徽标（`0.5×`、`免费` 等）；
+- **积分**：目录里的 `price_factor` 会显示成模型列表里的倍率徽标（`0.5×`、`0×` 等）；
   每轮 `span.model_request_end.model_usage.credits` 与会话累计 `session.usage` 汇总成
   积分统计，由会话头部的积分徽标展示（数据经插件自己的 `/qoder/credits` 路由提供，
   见「推理等级、积分倍率与积分统计」）。
@@ -204,10 +204,15 @@ assistant: ……
 
 **1. 模型列表里的积分倍率**
 
-`GET /api/v1/cloud/models` 给每个模型带一个 `price_factor`（相对基准价的积分倍率）。
-插件把它发布成 dsh 模型选择器里的**徽标**：`0.5×` / `0.8×` / `1×` / `1.25×`，免费模型
-（`price_factor = 0`，如促销期的 Flash）显示为 **免费 / Free**；大于 1 的倍率用警告色。
-同一个值也会写进模型的 `description`，在会显示描述的界面（如设置页模型列表）可见。
+`GET /api/v1/cloud/models` 给每个模型带一个 `price_factor`（相对基准价的**参考**积分倍率）。
+插件把它发布成 dsh 模型选择器里的**徽标**：`0×` / `0.5×` / `0.8×` / `1×` / `1.25×`；
+大于 1 的倍率用警告色。同一个值也会写进模型的 `description`，在会显示描述的界面
+（如设置页模型列表）可见。
+
+> `0×` 只是目录标称的参考倍率，**不是“这一轮不扣积分”的保证**：Cloud Agents 的计费项
+> 除模型调用外还有**云端沙箱运行时间**，而且目录倍率可能滞后于实际计费/只对订阅档生效。
+> 实测目录标 `0×` 的 `qfmodel` 一轮仍回传 `model_credits: 0.07`。以 Qoder 回传的
+> `session.usage` 为准（见下方积分统计）。
 
 **2. 推理等级（effort）**
 
@@ -248,6 +253,15 @@ Qoder 在两处给出积分：单次模型调用 `span.model_request_end.model_u
   显示的数字可能略滞后于控制台。
 - 若会话因 patch 被拒而换了新的云端 Session，旧 Session 的累计值会被**结转**到
   「本会话累计」上，同一次运行内数字不会倒退（宿主重启后统计从零开始，见下条）。
+- **头部徽标显示的是积分（Credits），不是时间。** 数字取自 `session.usage.total_credits`
+  （最多两位小数）；「本轮 / 本会话累计 / 本次运行累计」都是积分。唯一显示时间的地方是
+  思考过程块里的 `4.2s`（那是思考耗时）。
+- **为什么 `0×` 模型也会扣积分**：Qoder Cloud Agents 的计费由两部分组成——
+  **模型调用**（按 token 折算，受 `price_factor` 影响）+ **云沙箱运行时间**
+  （仅 Session `running` 时按秒计费，暂停/空闲不计费，按小时结算）。桥接模式每一轮都要
+  拉起云端沙箱，所以模型费即使是 0，沙箱时间也可能入账；面板的「本会话累计」下面拆出了
+  「模型 X · 沙箱 Y」，可以直接看是哪一项。另外沙箱费用结算有延迟：`session.usage`
+  快照可能先显示 0，下一轮或稍后才补上。
 - 积分是 Qoder 侧计费事实，dsh 自己的 token 计量（消息下方的「本轮用量」）与此独立：
   Qoder Cloud Agents 不返回 token 数，只返回积分。
 - 统计只保存在插件进程内存里；重启 dsh 后从下一轮开始重新累计（云端 Session 本身也
@@ -437,7 +451,8 @@ curl.exe -s "https://api.qoder.com/api/v1/cloud/models" -H "Authorization: Beare
 
 顺带一提：卡住的会话会**持续计费**（实测一个卡了 24 分钟的会话累计 `total_credits`
 5.56，其中 `sandbox_runtime_credits` 4.66）。桥接模式每轮都会拉起云端沙箱，所以
-「免费模型」不等于零成本——模型费可能是 0，沙箱运行时间照扣。
+「0× 模型」也不等于零成本——模型费可能是 0（甚至目录倍率与实扣不一致），沙箱运行
+时间照扣，以 `session.usage` 为准。
 
 ## 故障排查：`resuming a paused turn but no matching tool results were supplied`
 

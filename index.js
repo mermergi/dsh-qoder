@@ -1106,13 +1106,10 @@ function effortIdsForModel(model) {
  */
 function priceFactorBadge(factor) {
 	if (factor === void 0) return void 0;
-	if (factor === 0) return {
-		text: {
-			zh: "免费",
-			en: "Free"
-		},
-		tone: "success"
-	};
+	// A catalog `price_factor` is a REFERENCE rate, not a billing promise: the
+	// live API has been observed charging Credits for a 0-rate model, and Cloud
+	// Agents bills sandbox runtime on top of model calls. So a 0 rate is shown
+	// as the literal "0×" instead of a "Free" claim that the bill can contradict.
 	return {
 		text: `${formatFactor(factor)}×`,
 		tone: factor > 1 ? "warning" : factor < 1 ? "info" : "neutral"
