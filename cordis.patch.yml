@@ -26,6 +26,13 @@
         # offers the same levels per model, and switching one keeps the cloud
         # conversation (the Session's model is patched in place).
         defaultReasoningEffort: ""
+        # Per-model cloud context-window tiers, as "model=tokens" pairs:
+        #   modelContextWindows: "dmodel=400000,qfmodel=1000000"
+        # Each tier must be one of that model's available_context_windows; an
+        # empty entry falls back to agentContextWindow / the model default.
+        # The Settings → Models card renders the same map as one dropdown per
+        # model. Larger tiers cost more Qoder Credits per turn.
+        modelContextWindows: ""
         maxTokens: 8192
         systemPrompt: ""
         environmentId: ""

@@ -169,6 +169,12 @@ const SESSION_AGENT_PATCH_BETA = "session-agent-patch-2026-07-21";
  */
 const CREDIT_STATS_ROUTE = "/qoder/credits";
 /**
+ * Exact HTTP route serving the model catalog (ids, available context-window
+ * tiers, Credit rates) to the Settings card, so the per-model context-window
+ * control can be populated without putting a token in the browser.
+ */
+const MODEL_CATALOG_ROUTE = "/qoder/models";
+/**
  * Appended to the Agent's system prompt while local-tool bridging is on.
  *
  * Without it the model happily calls a *built-in* tool, reads the equivalent path
@@ -204,6 +210,11 @@ const Config = z.object({
 	// It must be a level that model advertises in its `efforts` array; an
 	// unsupported value is simply not offered for that model.
 	defaultReasoningEffort: z.string().default(""),
+	// Per-model cloud context-window tiers, as a compact map:
+	// "dmodel=400000,qfmodel=1000000". Each value must be one of that model's
+	// `available_context_windows`; an empty entry inherits `agentContextWindow`.
+	// The Settings card renders this as one dropdown per model.
+	modelContextWindows: z.string().default(""),
 	maxTokens: z.number().default(8192),
 	tlsMaxVersion: z.string().default("TLSv1.2"),
 	systemPrompt: z.string().default(""),
@@ -303,6 +314,7 @@ function resolveConnection(config, env = readProcessEnv) {
 		contextWindow: positiveInt(pick(config, "contextWindow"), 0),
 		agentContextWindow: positiveInt(pick(config, "agentContextWindow"), 0),
 		defaultReasoningEffort: str(pick(config, "defaultReasoningEffort"), "").trim().toLowerCase(),
+		modelContextWindows: parseModelContextWindows(pick(config, "modelContextWindows")),
 		maxTokens: positiveInt(pick(config, "maxTokens"), 8192),
 		systemPrompt: str(pick(config, "systemPrompt"), ""),
 		environmentId: str(pick(config, "environmentId"), "").trim(),
@@ -629,11 +641,57 @@ function buildCustomTools(prefix, tools, budget = QODER_MAX_TOOL_ENTRIES) {
  * @param learned - the Session's `agent.model.effective_context_window`, once known.
  * @returns a positive token count.
  */
-function effectiveContextWindow(connection, entry, learned = 0) {
-	// The runtime-resolved window a live Session reports is the closest thing to
-	// ground truth (environment overrides included), so it outranks the config tier
-	// and the catalog default — but not an explicit `contextWindow` override.
-	const stated = connection.contextWindow > 0 ? connection.contextWindow : learned > 0 ? learned : connection.agentContextWindow > 0 ? connection.agentContextWindow : entry?.defaultContextWindow ?? 0;
+/**
+ * Parse the per-model context-window map: `"dmodel=400000,qfmodel=1000000"`.
+ *
+ * The compact `id=tier` form is what the Settings card stages and what a
+ * `cordis.patch.yml` user can type; unknown or malformed entries are ignored
+ * (each value is still validated against the model's catalog tiers before it is
+ * sent).
+ * @param value - raw config text.
+ * @returns a plain `modelId -> tokens` map (never null).
+ */
+function parseModelContextWindows(value) {
+	const out = {};
+	if (typeof value === "string") {
+		for (const part of value.split(",")) {
+			const eq = part.indexOf("=");
+			if (eq <= 0) continue;
+			const id = part.slice(0, eq).trim();
+			const tier = Number(part.slice(eq + 1).trim());
+			if (/^[A-Za-z0-9_.:-]+$/.test(id) && Number.isInteger(tier) && tier > 0) out[id] = tier;
+		}
+	}
+	return out;
+}
+/**
+ * The cloud context-window tier to request for one model: its per-model entry
+ * when configured, otherwise the global `agentContextWindow` fallback.
+ * @param connection - resolved plugin config.
+ * @param model - Qoder model id.
+ * @returns token count, or 0 for the model's own default.
+ */
+function contextTierFor(connection, model) {
+	const perModel = connection.modelContextWindows?.[model];
+	if (Number.isInteger(perModel) && perModel > 0) return perModel;
+	return connection.agentContextWindow > 0 ? connection.agentContextWindow : 0;
+}
+/**
+ * The context window to report to dsh.
+ *
+ * Priority: an explicit `contextWindow` override, then the runtime-resolved
+ * window a live Session reported (the closest thing to ground truth), then the
+ * configured tier (per-model first), then the catalog default. The result is
+ * capped by the model's hard `max_input_tokens` ceiling, because promising dsh
+ * more than Qoder can hold would only surface later as a truncated Session.
+ * @param connection - resolved plugin config.
+ * @param entry - catalog entry for the model, when discovery succeeded.
+ * @param learned - the Session's `agent.model.effective_context_window`, once known.
+ * @param tier - configured tier for this model (0 = none).
+ * @returns a positive token count.
+ */
+function effectiveContextWindow(connection, entry, learned = 0, tier = 0) {
+	const stated = connection.contextWindow > 0 ? connection.contextWindow : learned > 0 ? learned : tier > 0 ? tier : entry?.defaultContextWindow ?? 0;
 	const ceiling = entry?.maxInputTokens ?? 0;
 	if (stated > 0) return ceiling > 0 ? Math.min(stated, ceiling) : stated;
 	return ceiling > 0 ? Math.min(DEFAULT_CONTEXT_WINDOW, ceiling) : DEFAULT_CONTEXT_WINDOW;
@@ -1455,6 +1513,49 @@ function serveCreditStats(req, res, stats) {
 		}
 	}
 }
+/**
+ * Answer the Settings card's catalog request: model ids plus the context-window
+ * tiers each accepts. The browser never sees the PAT; discovery runs on the
+ * Host with the credential the provider already resolves.
+ * @param req - inbound request (GET/HEAD).
+ * @param res - response; this function owns it.
+ * @param adapter - live provider adapter (provides the catalog cache).
+ */
+async function serveModelCatalog(req, res, adapter) {
+	try {
+		if (req.method !== "GET" && req.method !== "HEAD") {
+			res.writeHead(405, {
+				"content-type": "application/json; charset=utf-8",
+				"allow": "GET, HEAD",
+				"cache-control": "no-store"
+			});
+			res.end(JSON.stringify({ ok: false, error: "method not allowed" }));
+			return;
+		}
+		const { models, error } = await adapter.catalogForSettings();
+		res.writeHead(200, {
+			"content-type": "application/json; charset=utf-8",
+			"cache-control": "no-store",
+			"x-content-type-options": "nosniff"
+		});
+		if (req.method === "HEAD") {
+			res.end();
+			return;
+		}
+		res.end(JSON.stringify({
+			ok: error === void 0,
+			...error === void 0 ? {} : { error },
+			models
+		}));
+	} catch (error) {
+		try {
+			res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+			res.end(JSON.stringify({ ok: false, error: String(error?.message ?? error), models: [] }));
+		} catch {
+			/* the response is already gone */
+		}
+	}
+}
 //#endregion
 
 /**
@@ -1474,6 +1575,8 @@ class QoderSessionAdapter {
 	#agents = new Map();
 	/** model id -> catalog entry (display name plus the context-window facts) */
 	#catalog = new Map();
+	/** Last catalog-discovery failure, surfaced by catalogForSettings(). */
+	#catalogError;
 	/** model id -> the `effective_context_window` a live Session reported for it */
 	#effectiveWindows = new Map();
 
@@ -1507,6 +1610,7 @@ class QoderSessionAdapter {
 	 */
 	async #fetchCatalog() {
 		this.#catalogAttempted = true;
+		this.#catalogError = void 0;
 		try {
 			const connection = this.#connection();
 			const token = await this.#resolveToken();
@@ -1514,9 +1618,33 @@ class QoderSessionAdapter {
 			for (const model of models) this.#catalog.set(model.id, model);
 			return models;
 		}
-		catch {
+		catch (error) {
+			// Keep the failure so the Settings card can explain an empty catalog
+			// (token/region/offline) instead of rendering an unexplained empty list.
+			this.#catalogError = String(error?.message ?? error);
 			return [];
 		}
+	}
+	/**
+	 * Read the catalog for the Settings card: every model with the context-window
+	 * tiers it accepts. Uses the same discovery/cache as the model picker.
+	 * @returns `{ models, error }`; `error` is set when discovery failed.
+	 */
+	async catalogForSettings() {
+		this.#catalogAttempted = false;
+		const models = await this.#ensureCatalog();
+		return {
+			models: models.map((model) => ({
+				id: model.id,
+				name: model.name,
+				priceFactor: model.priceFactor,
+				efforts: model.efforts,
+				defaultContextWindow: model.defaultContextWindow,
+				availableContextWindows: model.availableContextWindows,
+				maxInputTokens: model.maxInputTokens
+			})),
+			error: this.#catalogError
+		};
 	}
 	/** Single-flight variant of {@link #fetchCatalog}, used when a model is unknown. */
 	#ensureCatalog() {
@@ -1577,7 +1705,7 @@ class QoderSessionAdapter {
 			provider,
 			id: model,
 			name: entry?.name ?? titleCase(model),
-			context: { contextWindow: effectiveContextWindow(connection, entry, this.#effectiveWindows.get(model) ?? 0) },
+			context: { contextWindow: effectiveContextWindow(connection, entry, this.#effectiveWindows.get(model) ?? 0, contextTierFor(connection, model)) },
 			defaultMaxTokens: connection.maxTokens,
 			...reasoning === void 0 ? {} : { reasoning }
 		};
@@ -1635,7 +1763,7 @@ class QoderSessionAdapter {
 		// declares a default, dsh has already materialised it here.
 		const entry = await this.#catalogEntry(model);
 		const effort = str(options.reasoningEffort, "");
-		const modelSpec = agentModelSpec(model, entry, connection.agentContextWindow, effort, this.#warn);
+		const modelSpec = agentModelSpec(model, entry, contextTierFor(connection, model), effort, this.#warn);
 
 		// A single cancellable lifecycle for the whole turn.
 		const controller = new AbortController();
@@ -2222,6 +2350,13 @@ function apply(ctx, config) {
 				path: CREDIT_STATS_ROUTE,
 				handler: (req, res) => serveCreditStats(req, res, stats)
 			}), "qoder: credit statistics route");
+			// The Settings card needs the catalog (ids + available tiers) to render
+			// one context-window dropdown per model; this route keeps the PAT host-side.
+			webCtx.effect(() => webCtx.webServer.register({
+				kind: "exact",
+				path: MODEL_CATALOG_ROUTE,
+				handler: (req, res) => serveModelCatalog(req, res, adapter)
+			}), "qoder: model catalog route");
 		});
 		trace("apply() completed successfully");
 	} catch (error) {
@@ -2248,6 +2383,9 @@ const __test = {
 	priceFactorBadge,
 	reasoningInfoFor,
 	serveCreditStats,
+	contextTierFor,
+	parseModelContextWindows,
+	serveModelCatalog,
 	thinkingTextOf,
 	thinkingSummaryOf,
 	EFFORT_INFO,

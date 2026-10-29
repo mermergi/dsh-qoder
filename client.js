@@ -53,6 +53,14 @@ window.__ModuleLoader__.load({
 			readOnly: "This deployment stores settings read-only.",
 			defaultReasoningEffort: "Default reasoning effort",
 			defaultReasoningEffortHint: "Leave blank to follow the model's default; accepted values: low / medium / high / xhigh / max.",
+			"ctx.title": "Cloud context window",
+			"ctx.hint": "Per-model context-window tier for the cloud Session. Larger tiers cost more Credits per turn; the setting applies from the next turn and patches the live Session in place (history kept).",
+			"ctx.modelDefault": "Model default ({tier})",
+			"ctx.rowAria": "Cloud context window for {model}",
+			"ctx.loading": "Reading the model catalog…",
+			"ctx.error": "Could not read the model catalog ({error}). Check the token and region above.",
+			"ctx.empty": "The catalog returned no models.",
+			"ctx.overridden": "Overridden",
 			"credits.title": "Qoder credits",
 			"credits.aria": "Qoder credits: {credits}",
 			"credits.turn": "This turn",
@@ -85,6 +93,14 @@ window.__ModuleLoader__.load({
 			readOnly: "本部署的设置为只读。",
 			defaultReasoningEffort: "默认推理强度",
 			defaultReasoningEffortHint: "留空 = 跟随模型默认；可选 low / medium / high / xhigh / max。",
+			"ctx.title": "云端上下文窗口",
+			"ctx.hint": "每个模型的云端 Session 上下文窗口档位。档位越大每轮积分越高；保存后从下一轮生效，会原地 patch 当前会话（历史保留）。",
+			"ctx.modelDefault": "模型默认（{tier}）",
+			"ctx.rowAria": "{model} 的云端上下文窗口",
+			"ctx.loading": "正在读取模型目录…",
+			"ctx.error": "读不到模型目录（{error}）。请先检查上方的令牌与区域。",
+			"ctx.empty": "模型目录里没有模型。",
+			"ctx.overridden": "已覆盖",
 			"credits.title": "Qoder 积分",
 			"credits.aria": "Qoder 积分：{credits}",
 			"credits.turn": "本轮",
@@ -112,6 +128,176 @@ window.__ModuleLoader__.load({
 			};
 		}
 		//#endregion
+		//#region cloud context windows
+		/** Compact tier label: 200000 -> 200k, 1000000 -> 1M, 0/absent -> em dash. */
+		function formatContextWindow(tokens) {
+			if (typeof tokens !== "number" || !Number.isInteger(tokens) || tokens <= 0) return EM_DASH;
+			if (tokens >= 1000000) return `${Math.round(tokens / 100000) / 10}M`.replace(".0M", "M");
+			return `${Math.round(tokens / 1000)}k`;
+		}
+		/**
+		* Parse the staged per-model tier map (`"dmodel=400000,qfmodel=1000000"`).
+		* Malformed entries are dropped; the host validates each value against the
+		* model's catalog tiers before sending it.
+		* @param text - the raw staged field text.
+		* @returns `modelId -> tokens`.
+		*/
+		function parseContextWindows(text) {
+			const out = {};
+			if (typeof text !== "string") return out;
+			for (const part of text.split(",")) {
+				const eq = part.indexOf("=");
+				if (eq <= 0) continue;
+				const id = part.slice(0, eq).trim();
+				const tier = Number(part.slice(eq + 1).trim());
+				if (/^[A-Za-z0-9_.:-]+$/.test(id) && Number.isInteger(tier) && tier > 0) out[id] = tier;
+			}
+			return out;
+		}
+		/**
+		* Encode the map back into the staged `"id=tier,..."` form, sorted so that
+		* editing one row never reorders or duplicates the others.
+		* @param map - `modelId -> tokens`.
+		* @returns the staged text.
+		*/
+		function encodeContextWindows(map) {
+			return Object.keys(map ?? {}).filter((id) => Number.isInteger(map[id]) && map[id] > 0).sort().map((id) => `${id}=${map[id]}`).join(",");
+		}
+		/**
+		* One context-window dropdown per catalog model.
+		*
+		* The section is backed by the same text field the manual config uses, so
+		* every change is only STAGED here and the form's Save stays the single
+		* commit point. Models whose catalog lists no selectable tier keep a disabled
+		* "model default" row instead of disappearing.
+		* @param props.models - catalog models from the Host route.
+		* @param props.status - `"loading"`, `"ready"`, or `"error"`.
+		* @param props.error - catalog failure text.
+		* @param props.map - current staged map.
+		* @param props.t - locale reader.
+		* @param props.disabled - settings document is read-only.
+		* @param props.overridden - the user layer carries this field.
+		* @param props.onPick - `(modelId, tier)`; tier 0 clears the entry.
+		* @param props.onReset - stage a clear back to the composition layer.
+		* @returns the section element.
+		*/
+		function ContextWindowSection(props) {
+			const { models, status, error, map, t, disabled, overridden, onPick, onReset } = props;
+			const rows = Array.isArray(models) ? models : [];
+			const sectionStyle = { display: "flex", flexDirection: "column", gap: "6px", marginTop: "4px" };
+			const headerStyle = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" };
+			const titleStyle = { fontWeight: 600, fontSize: "13px" };
+			const hintStyle = { color: "var(--dsw-alias-label-tertiary)", fontSize: "12px", lineHeight: "18px" };
+			const errorStyle = { color: "var(--dsw-alias-state-error-primary)", fontSize: "12px", lineHeight: "18px" };
+			const rowStyle = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", padding: "2px 0" };
+			const labelStyle = { display: "flex", flexDirection: "column", minWidth: 0 };
+			const nameStyle = { color: "var(--dsw-alias-label-primary)", fontSize: "13px", lineHeight: "18px" };
+			const idStyle = { color: "var(--dsw-alias-label-tertiary)", fontSize: "11px", lineHeight: "16px" };
+			const selectStyle = {
+				flex: "none",
+				maxWidth: "180px",
+				height: "26px",
+				padding: "0 6px",
+				borderRadius: "var(--dsw-radius-sm)",
+				border: "1px solid var(--dsw-alias-border-l1)",
+				background: "var(--dsw-alias-bg-module-platform)",
+				color: "var(--dsw-alias-label-primary)",
+				fontFamily: "inherit",
+				fontSize: "12px"
+			};
+			const resetStyle = {
+				border: "none",
+				background: "transparent",
+				padding: "0",
+				color: "var(--dsw-alias-state-business-primary)",
+				font: "inherit",
+				fontSize: "12px",
+				cursor: "pointer"
+			};
+			return (0, react_jsx_runtime.jsxs)("div", {
+				style: sectionStyle,
+				children: [
+					(0, react_jsx_runtime.jsxs)("div", {
+						style: headerStyle,
+						children: [
+							(0, react_jsx_runtime.jsx)("div", { style: titleStyle, children: t("ctx.title") }),
+							overridden ? (0, react_jsx_runtime.jsx)("button", { type: "button", style: resetStyle, onClick: onReset, children: t("reset") }) : null
+						]
+					}),
+					(0, react_jsx_runtime.jsx)("div", { style: hintStyle, children: t("ctx.hint") }),
+					status === "loading" ? (0, react_jsx_runtime.jsx)("div", { style: hintStyle, children: t("ctx.loading") }) : null,
+					status === "error" ? (0, react_jsx_runtime.jsx)("div", { style: errorStyle, children: t("ctx.error", { error: error ?? "?" }) }) : null,
+					status === "ready" && rows.length === 0 ? (0, react_jsx_runtime.jsx)("div", { style: hintStyle, children: t("ctx.empty") }) : null,
+					...rows.map((model) => {
+						const windows = Array.isArray(model.availableContextWindows) ? model.availableContextWindows : [];
+						const current = Number.isInteger(map?.[model.id]) ? map[model.id] : 0;
+						const label = model.name ?? model.id;
+						return (0, react_jsx_runtime.jsxs)("div", {
+							key: `ctx-${model.id}`,
+							style: rowStyle,
+							children: [
+								(0, react_jsx_runtime.jsxs)("div", {
+									style: labelStyle,
+									children: [
+										(0, react_jsx_runtime.jsx)("span", { style: nameStyle, children: label }),
+										(0, react_jsx_runtime.jsx)("span", { style: idStyle, children: model.id })
+									]
+								}),
+								(0, react_jsx_runtime.jsx)("select", {
+									"aria-label": t("ctx.rowAria", { model: label }),
+									style: selectStyle,
+									disabled: disabled || windows.length === 0,
+									value: current > 0 ? String(current) : "",
+									onChange: (event) => {
+										const tier = Number(event.target.value);
+										onPick(model.id, Number.isInteger(tier) && tier > 0 ? tier : 0);
+									},
+									children: [
+										(0, react_jsx_runtime.jsx)("option", { value: "", children: t("ctx.modelDefault", { tier: formatContextWindow(model.defaultContextWindow) }) }),
+										...windows.map((tier) => (0, react_jsx_runtime.jsx)("option", { value: String(tier), children: formatContextWindow(tier) }, String(tier)))
+									]
+								})
+							]
+						});
+					})
+				]
+			});
+		}
+		/**
+		* Read the Host's model catalog once the settings namespace is served.
+		* The route is the same plugin-owned Web route as the credit statistics;
+		* without it (or without a token) the section reports why it is empty.
+		* @param enabled - whether the card is live (namespace served).
+		* @returns `{ status, models, error }`.
+		*/
+		function useModelCatalog(enabled) {
+			const [catalog, setCatalog] = react.useState({ status: "loading", models: [], error: null });
+			react.useEffect(() => {
+				if (!enabled) return;
+				let cancelled = false;
+				fetch("qoder/models", {
+					method: "GET",
+					credentials: "same-origin",
+					cache: "no-store",
+					headers: { accept: "application/json" }
+				}).then(async (response) => {
+					const body = await response.json().catch(() => null);
+					if (cancelled) return;
+					if (!response.ok || body === null || !Array.isArray(body.models)) {
+						setCatalog({ status: "error", models: [], error: body?.error ?? `HTTP ${response.status}` });
+						return;
+					}
+					setCatalog({ status: "ready", models: body.models, error: body.ok === false ? body.error ?? null : null });
+				}).catch((error) => {
+					if (!cancelled) setCatalog({ status: "error", models: [], error: String(error?.message ?? error) });
+				});
+				return () => {
+					cancelled = true;
+				};
+			}, [enabled]);
+			return catalog;
+		}
+		//#endregion
 		//#region component
 		/**
 		* Render the Qoder configuration card inline on the Models page.
@@ -122,6 +308,14 @@ window.__ModuleLoader__.load({
 		function QoderCard(props) {
 			const { t } = props;
 			const state = props.useQoderCard((snapshot) => snapshot);
+			const catalog = useModelCatalog(state.available === true);
+			const contextWindows = parseContextWindows(state.modelContextWindows?.text ?? "");
+			const pickContextWindow = (modelId, tier) => {
+				const next = { ...contextWindows };
+				if (tier > 0) next[modelId] = tier;
+				else delete next[modelId];
+				props.edit("modelContextWindows", encodeContextWindows(next));
+			};
 			return (0, react_jsx_runtime.jsxs)("div", {
 				style: { display: "flex", flexDirection: "column", gap: "8px", marginTop: "8px" },
 				children: [
@@ -190,6 +384,17 @@ window.__ModuleLoader__.load({
 								},
 								onReset: () => {
 									props.resetField("defaultReasoningEffort");
+								}
+							}),
+							(0, react_jsx_runtime.jsx)(ContextWindowSection, {
+								...catalog,
+								map: contextWindows,
+								t,
+								disabled: !state.writable,
+								overridden: state.modelContextWindows?.overridden === true,
+								onPick: pickContextWindow,
+								onReset: () => {
+									props.resetField("modelContextWindows");
 								}
 							})
 						]
@@ -621,7 +826,8 @@ window.__ModuleLoader__.load({
 				this.form = new primitives.SettingsFormModel(scope, [
 					primitives.settingsTextField("baseURL"),
 					primitives.settingsTextField("defaultModel"),
-					primitives.settingsTextField("defaultReasoningEffort")
+					primitives.settingsTextField("defaultReasoningEffort"),
+					primitives.settingsTextField("modelContextWindows")
 				], [{
 					field: API_KEY_FIELD,
 					write: (text) => this.writeKey(text)
@@ -638,6 +844,7 @@ window.__ModuleLoader__.load({
 					baseURL: this.form.field("baseURL"),
 					defaultModel: this.form.field("defaultModel"),
 					defaultReasoningEffort: this.form.field("defaultReasoningEffort"),
+					modelContextWindows: this.form.field("modelContextWindows"),
 					apiKey: this.form.field(API_KEY_FIELD),
 					apiKeyConfigured: this.credential.configured,
 					apiKeyWritable: this.credential.writable
@@ -751,7 +958,11 @@ window.__ModuleLoader__.load({
 			formatCredits,
 			formatPriceFactor,
 			CreditsChip,
-			CreditsPanel
+			CreditsPanel,
+			parseContextWindows,
+			encodeContextWindows,
+			formatContextWindow,
+			ContextWindowSection
 		};
 		return module.exports;
 	}

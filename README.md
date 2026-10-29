@@ -93,7 +93,7 @@ dsh 每次调用适配器时，`options.tools` 给的是**当前 agent 可见的
 | 哪一侧 | 由什么决定 | 管的是什么 |
 | --- | --- | --- |
 | dsh | 适配器 `resolveModel()` 返回的 `context.contextWindow` | dsh **自己那份 history** 的 token 计量与 compaction 阈值（`thresholdTokens = floor(min(contextWindow × thresholdRatio, 预算))`），以及界面上「~已用 / 总量」的分母 |
-| Qoder | Agent 的 `model.context_window` 档位（来自模型目录 `available_context_windows`，不传则用 `default_context_window`，硬上限 `max_input_tokens`） | **云端 Session 自己累积**的全部上下文：系统提示（含桥接指令）+ 工具 schema + 每轮工具结果 + thinking |
+| Qoder | Agent 的 `model.context_window` 档位（设置页逐模型选择，或全局 `agentContextWindow`；来自模型目录 `available_context_windows`，不传则用 `default_context_window`，硬上限 `max_input_tokens`） | **云端 Session 自己累积**的全部上下文：系统提示（含桥接指令）+ 工具 schema + 每轮工具结果 + thinking |
 
 插件现在的做法：
 
@@ -185,8 +185,8 @@ assistant: ……
    声明的 keyed 子插槽 `settings.models.provider-card`（`key = "llm-qoder"`），于是
    **Qoder 卡片上会直接内嵌一个配置表单**：一个 PAT 输入框（经 `credentials` 域写入
    凭据引用 `QODER_API_KEY`，正是 `resolveToken` 读取的名字）+ 接口地址 + 默认模型 +
-   **默认推理强度**，点「保存」即生效，无需再打开任何文件。同一个浏览器包还在**会话
-   头部**挂了一个 **Qoder 积分徽标**（见下一节）。
+   **默认推理强度**，外加**每个模型的云端上下文窗口下拉框**，点「保存」即生效，无需再
+   打开任何文件。同一个浏览器包还在**会话头部**挂了一个 **Qoder 积分徽标**（见下一节）。
 
 > `client.js` 通过 package.json 的 `dsh.client`（`platform: web`）+ `exports["./client"]`
 > 被宿主 `ClientModuleRegistry` 发现并作为 `/plugins` 资源提供。**新增该声明后需要完全
@@ -229,7 +229,21 @@ dsh，模型选择器里就会出现和官方模型一致的**推理强度子菜
   （beta 头 `session-agent-patch-2026-07-21`），这是 Qoder 文档里的「动态更新运行时配置」。
   只有 patch 被拒（极端情况）才退回「新建 Session + 历史回放」。
 
-**3. 积分消耗统计（会话头部徽标）**
+**3. 每个模型的云端上下文窗口（设置页）**
+
+**设置 → 模型 → Qoder 卡片**新增「云端上下文窗口」区：每个模型一行下拉框，选项来自该
+模型目录的 `available_context_windows`（例如 `200k` / `400k` / `1M`），默认项是
+「模型默认（当前值）」。选择会暂存到表单，点「保存」后写入 `modelContextWindows`
+（紧凑格式 `"dmodel=400000,qfmodel=1000000"`）；清空/「恢复默认」则回落到全局
+`agentContextWindow`（YAML 配置）或模型自身默认。
+
+- 更大的窗口每轮积分更高；模型的 `max_input_tokens` 仍是硬上限，上报给 dsh 的窗口会被它封顶。
+- 保存后从**下一轮**生效：插件把档位作为 `model.context_window` **原地 patch** 当前云端
+  Session（历史保留）；未被使用过的模型则从下一个新建 Session 开始生效。
+- 该区通过插件自己的 `GET /qoder/models` 路由读取目录，PAT 不出宿主；路由不可用（如
+  Electron 外壳）或读取失败时，卡片会显示原因，仍可在 `cordis.patch.yml` 手写该字段。
+
+**4. 积分消耗统计（会话头部徽标）**
 
 Qoder 在两处给出积分：单次模型调用 `span.model_request_end.model_usage.credits`，以及
 每个 idle 前的会话累计 `session.usage`（`model_credits` / `sandbox_runtime_credits` /
@@ -267,7 +281,7 @@ Qoder 在两处给出积分：单次模型调用 `span.model_request_end.model_u
 - 统计只保存在插件进程内存里；重启 dsh 后从下一轮开始重新累计（云端 Session 本身也
   因重启而重建）。历史会话不会回填旧数字。
 
-**4. 思考过程**
+**5. 思考过程**
 
 `agent.thinking` 被转成 dsh 的 `reasoning` 块，因此对话里会出现「思考过程」折叠行。
 Qoder Cloud Agents **不公开推理正文**（官方文档明写 `agent.thinking never exposes
@@ -347,8 +361,9 @@ refs:
 | `baseURL` | `https://api.qoder.com` | Qoder Cloud API 根地址；**必须与账号区域一致**（全球 `api.qoder.com`，中国 `api.qoder.com.cn`） |
 | `defaultModel` | `ultimate` | 新建 Agent 使用的模型 id；以该区域 `GET /api/v1/cloud/models` 为准（中国区无 `ultimate`，如 `dmodel`/`qmodel_38max`/`auto`） |
 | `contextWindow` | `0` | 上报给 dsh 的上下文窗口；`0` = 按 Qoder 模型目录的真实窗口（受 `max_input_tokens` 封顶） |
-| `agentContextWindow` | `0` | 发给 Qoder 的 `model.context_window` 档位（必须 ∈ 该模型的 `available_context_windows`）；`0` = 用模型默认。档位越大每轮积分越多 |
+| `agentContextWindow` | `0` | 发给 Qoder 的 `model.context_window` 全局兜底档位（必须 ∈ 该模型的 `available_context_windows`）；`0` = 用模型默认。**单个模型的 `modelContextWindows` 优先**；档位越大每轮积分越多 |
 | `defaultReasoningEffort` | 空 | 会话未显式选择推理等级时使用的默认等级；留空 = 用模型目录的 `default_effort`。必须是该模型 `efforts` 里的值（`none` 仅在支持关闭思考的模型上提供）。也可以在模型选择器里逐会话改 |
+| `modelContextWindows` | 空 | **每个模型**的云端上下文窗口档位，格式 `"模型id=tokens,模型id=tokens"`（如 `"dmodel=400000,qfmodel=1000000"`）。值必须 ∈ 该模型 `available_context_windows`；留空/清空则回落到 `agentContextWindow`。设置页 Qoder 卡片提供了逐模型下拉框，一般不用手写 |
 | `maxTokens` | `8192` | 上报给 dsh 的默认 max tokens |
 | `tlsMaxVersion` | `TLSv1.2` | 允许协商的最大 TLS 版本；部分网络会重置 TLS1.3 握手导致 `transport failed`，保持 1.2 即可 |
 | `systemPrompt` | 空 | Qoder Agent 的系统提示 |

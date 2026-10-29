@@ -65,6 +65,19 @@ const reactDomStub = {
 
 /** Base React surface: enough for apply() and the settings card (which uses no hooks). */
 const baseReactStub = {
+  useState(initial) {
+    return [typeof initial === "function" ? initial() : initial, () => {}];
+  },
+  useEffect() {},
+  useRef(initial) {
+    return { current: initial };
+  },
+  useMemo(factory) {
+    return factory();
+  },
+  useCallback(fn) {
+    return fn;
+  },
   createElement(type, props, ...children) {
     return { type, props: { ...(props ?? {}), children: children.length > 1 ? children : children[0] } };
   },
@@ -382,6 +395,14 @@ assert.deepEqual(Object.keys(zhDictionary).sort(), Object.keys(enDictionary).sor
 for (const key of [
   "defaultReasoningEffort",
   "defaultReasoningEffortHint",
+  "ctx.title",
+  "ctx.hint",
+  "ctx.modelDefault",
+  "ctx.rowAria",
+  "ctx.loading",
+  "ctx.error",
+  "ctx.empty",
+  "ctx.overridden",
   "credits.title",
   "credits.aria",
   "credits.turn",
@@ -410,6 +431,7 @@ const formModel = formModelInstances[0];
 assert.ok(formModel, "SettingsFormModel was not constructed");
 const projection = formModel.project();
 assert.deepEqual(projection.defaultReasoningEffort, { text: "", overridden: false, invalid: false });
+assert.deepEqual(projection.modelContextWindows, { text: "", overridden: false, invalid: false });
 assert.ok("baseURL" in projection && "defaultModel" in projection && "apiKey" in projection);
 console.log("form projection includes defaultReasoningEffort OK");
 
@@ -425,7 +447,8 @@ const cardState = {
   apiKey: { text: "", overridden: false, invalid: false },
   baseURL: { text: "", overridden: false, invalid: false },
   defaultModel: { text: "ultimate", overridden: false, invalid: false },
-  defaultReasoningEffort: { text: "", overridden: false, invalid: false }
+  defaultReasoningEffort: { text: "", overridden: false, invalid: false },
+  modelContextWindows: { text: "dmodel=400000", overridden: true, invalid: false }
 };
 const cardTree = cardSlot.component({
   t,
@@ -448,6 +471,46 @@ const cardHtml = serialize(cardTree);
 assert.ok(cardHtml.includes('id="plugin-config-qoder-effort"'), "rendered card lacks the effort input id");
 assert.ok(cardHtml.includes("默认推理强度"), "rendered card lacks the localized effort label");
 console.log("settings card renders plugin-config-qoder-effort OK");
+
+// The context-window section: one staged field, pure helpers, one dropdown row per model.
+const { parseContextWindows, encodeContextWindows, formatContextWindow, ContextWindowSection } = client.__test;
+assert.equal(formatContextWindow(200000), "200k");
+assert.equal(formatContextWindow(128000), "128k");
+assert.equal(formatContextWindow(1000000), "1M");
+assert.equal(formatContextWindow(400000), "400k");
+assert.equal(formatContextWindow(0), "\u2014");
+assert.deepEqual(parseContextWindows("dmodel=400000,broken,x=0,qfmodel=1000000"), { dmodel: 400000, qfmodel: 1000000 });
+assert.equal(encodeContextWindows({ qfmodel: 1000000, dmodel: 400000 }), "dmodel=400000,qfmodel=1000000");
+const picked = [];
+let contextReset = false;
+const contextTree = ContextWindowSection({
+  status: "ready",
+  models: [
+    { id: "dmodel", name: "DeepSeek-V4-Pro", defaultContextWindow: 200000, availableContextWindows: [200000, 400000, 1000000] },
+    { id: "fixed", name: "Fixed Model", defaultContextWindow: 200000, availableContextWindows: [] }
+  ],
+  map: { dmodel: 400000 },
+  t,
+  disabled: false,
+  overridden: true,
+  onPick: (id, tier) => picked.push([id, tier]),
+  onReset: () => {
+    contextReset = true;
+  }
+});
+const contextHtml = serialize(contextTree);
+assert.ok(contextHtml.includes("云端上下文窗口"), "context section title missing");
+assert.ok(contextHtml.includes("模型默认（200k）"), "context section default option missing");
+assert.ok(contextHtml.includes("400k") && contextHtml.includes("1M"), "context tiers missing");
+const contextSelect = findNodes(contextTree, (node) => node.type === "select" && String(node.props["aria-label"]).includes("DeepSeek"))[0];
+assert.ok(contextSelect, "dmodel context select missing");
+contextSelect.props.onChange({ target: { value: "1000000" } });
+contextSelect.props.onChange({ target: { value: "" } });
+assert.deepEqual(picked, [["dmodel", 1000000], ["dmodel", 0]]);
+const resetButton = findNodes(contextTree, (node) => node.type === "button")[0];
+resetButton.props.onClick();
+assert.equal(contextReset, true);
+console.log("context-window section (per-model dropdowns) OK");
 //#endregion
 
 //#region header chip registration

@@ -22,10 +22,12 @@ const realFetch = globalThis.fetch;
 const {
 	QoderCreditStats,
 	agentModelSpec,
+	contextTierFor,
 	effortIdsForModel,
 	formatFactor,
 	modelDescription,
 	normalizeModelList,
+	parseModelContextWindows,
 	priceFactorBadge,
 	reasoningInfoFor,
 	serveCreditStats,
@@ -104,8 +106,21 @@ ok("Agent model value carries effort and the context tier, dropping unsupported 
 	const warnings = [];
 	assert.equal(agentModelSpec("dmodel", entry, 0, "low", (message) => warnings.push(message)), "dmodel");
 	assert.equal(warnings.length, 1);
+	assert.equal(agentModelSpec("dmodel", { efforts: ["high"], availableContextWindows: [200000] }, 400000, undefined, () => {}), "dmodel", "unsupported tier dropped");
+	assert.deepEqual(agentModelSpec("dmodel", undefined, 400000, undefined, () => {}), { id: "dmodel", context_window: 400000 }, "no catalog: let Qoder validate");
 	assert.equal(agentModelSpec("dmodel", { efforts: ["high"] }, 0, "max", () => {}), "dmodel", "unknown model still sends nothing");
 	assert.deepEqual(agentModelSpec("dmodel", undefined, 0, "max", () => {}), { id: "dmodel", effort: "max" }, "no catalog: let Qoder validate");
+});
+
+ok("per-model context-window config parses and resolves", () => {
+	const map = parseModelContextWindows("dmodel=400000, qfmodel=1000000, broken, x=0, y=-1, z=abc");
+	assert.deepEqual(map, { dmodel: 400000, qfmodel: 1000000 });
+	assert.deepEqual(parseModelContextWindows(""), {});
+	assert.deepEqual(parseModelContextWindows(undefined), {});
+	const connection = { modelContextWindows: { dmodel: 400000 }, agentContextWindow: 200000 };
+	assert.equal(contextTierFor(connection, "dmodel"), 400000, "per-model tier wins");
+	assert.equal(contextTierFor(connection, "other"), 200000, "global tier is the fallback");
+	assert.equal(contextTierFor({ modelContextWindows: {}, agentContextWindow: 0 }, "other"), 0);
 });
 
 ok("credit store replaces cumulative snapshots and sums per-call spans", () => {
@@ -245,6 +260,7 @@ function baseConfig(overrides = {}) {
 		contextWindow: 0,
 		agentContextWindow: 0,
 		defaultReasoningEffort: "",
+		modelContextWindows: "",
 		maxTokens: 8192,
 		tlsMaxVersion: "TLSv1.2",
 		systemPrompt: "",
@@ -341,9 +357,10 @@ async function collect(stream) {
 		{ id: "turn1", text: "hello from Qoder", credits: 0.27 },
 		{ id: "turn2", text: "second answer", credits: 0.13 }
 	] };
-	const captured = await boot({ fetchImpl: stubFetch(state) });
+	const captured = await boot({ fetchImpl: stubFetch(state), config: baseConfig({ modelContextWindows: "dmodel=400000" }) });
 	assert.ok(captured.adapter !== void 0, "adapter registered");
 	assert.ok(captured.routes.some((route) => route.path === "/qoder/credits"), "credit route registered");
+	assert.ok(captured.routes.some((route) => route.path === "/qoder/models"), "model catalog route registered");
 
 	const models = await captured.adapter.listModels("qoder");
 	assert.equal(models.length, 2);
@@ -357,7 +374,7 @@ async function collect(stream) {
 	const resolved = await captured.adapter.resolveModel("qoder", "dmodel");
 	assert.deepEqual(resolved.reasoning.efforts.map((effort) => effort.id), ["high", "max"]);
 	assert.equal(resolved.reasoning.defaultEffort, "max");
-	assert.equal(resolved.context.contextWindow, 96000);
+	assert.equal(resolved.context.contextWindow, 96000, "configured 400k tier is capped by max_input_tokens");
 
 	// One bridged turn: thinking → reasoning block, message → text, spans → credits.
 	const chunks = await collect(captured.adapter.stream({
@@ -377,6 +394,7 @@ async function collect(stream) {
 	const finish = chunks.at(-1);
 	assert.deepEqual(finish, { type: "finish", reason: { kind: "stop" } });
 	assert.equal(state.agents[0].model.effort, "high", "Agent created with the selected effort");
+	assert.equal(state.agents[0].model.context_window, 400000, "Agent created with the per-model tier");
 	console.log(`ok ${++checks} - first turn chunks (thinking, text, credits)`);
 
 	const route = captured.routes.find((item) => item.path === "/qoder/credits");
@@ -390,6 +408,18 @@ async function collect(stream) {
 	assert.equal(stats.effort, "high");
 	assert.equal(stats.priceFactor, 0.5);
 	console.log(`ok ${++checks} - credit route reports the first turn`);
+
+	const catalog = JSON.parse(await (async () => {
+		const response = fakeResponse();
+		await captured.routes.find((item) => item.path === "/qoder/models").handler({ method: "GET", url: "/qoder/models" }, response);
+		return response.body;
+	})());
+	assert.equal(catalog.ok, true);
+	assert.equal(catalog.models.length, 2);
+	const catalogDmodel = catalog.models.find((model) => model.id === "dmodel");
+	assert.deepEqual(catalogDmodel.availableContextWindows, [200000, 400000]);
+	assert.equal(catalogDmodel.defaultContextWindow, 200000);
+	console.log(`ok ${++checks} - settings catalog route exposes context tiers`);
 
 	// Second turn, different model + effort: patched in place, no new Agent or Session.
 	state.frames.unshift({ id: "turn3", text: "switched model", credits: 0.2 });
@@ -467,6 +497,7 @@ async function collect(stream) {
 ok("Config exposes the new default reasoning effort field", () => {
 	const resolved = Config({});
 	assert.equal(resolved.defaultReasoningEffort, "");
+	assert.equal(resolved.modelContextWindows, "");
 	assert.equal(typeof resolved.defaultModel, "string");
 });
 //#endregion
