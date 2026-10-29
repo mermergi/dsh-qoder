@@ -494,11 +494,16 @@ async function collect(stream) {
 //#endregion
 
 //#region options / config schema
-ok("Config exposes the new default reasoning effort field", () => {
+ok("Config exposes the card fields as volatile (settings writes are accepted)", () => {
 	const resolved = Config({});
-	assert.equal(resolved.defaultReasoningEffort, "");
-	assert.equal(resolved.modelContextWindows, "");
-	assert.equal(typeof resolved.defaultModel, "string");
+	// Volatile leaves resolve to update boxes, which is exactly what the loader
+	// hands the plugin; the values themselves are read through .get().
+	assert.equal(typeof resolved.defaultReasoningEffort, "object");
+	assert.equal(typeof resolved.modelContextWindows, "object");
+	for (const field of ["baseURL", "defaultModel", "defaultReasoningEffort", "modelContextWindows"]) {
+		assert.equal(Config.dict[field].meta.volatile, true, `${field} must be volatile for a Settings save`);
+	}
+	assert.equal(Config.dict.contextWindow.meta.volatile, undefined, "non-card fields stay composition-only");
 });
 //#endregion
 

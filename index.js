@@ -193,8 +193,12 @@ const BRIDGE_DIRECTIVE = "IMPORTANT: You run in Qoder's cloud, which has NO acce
  */
 const Config = z.object({
 	apiKeyEnv: z.string().role("credential-ref").default("QODER_API_KEY").volatile(),
-	baseURL: z.string().default("https://api.qoder.com"),
-	defaultModel: z.string().default("ultimate"),
+	// Every field the Settings card writes must be `volatile`: the settings service
+	// rejects a save whose path is not volatile ("Config field ... is not volatile"),
+	// which is exactly the generic "the deployment did not accept these values"
+	// message the card shows. Volatile also means a save applies without a restart.
+	baseURL: z.string().default("https://api.qoder.com").volatile(),
+	defaultModel: z.string().default("ultimate").volatile(),
 	// Context window reported to dsh, which uses it for its own compaction budget.
 	// Leave it at 0 to take the window the Qoder model catalog states for the
 	// selected model (`default_context_window`, capped by `max_input_tokens`); set
@@ -209,12 +213,12 @@ const Config = z.object({
 	// not picked one ("" = whichever `default_effort` the model catalog states).
 	// It must be a level that model advertises in its `efforts` array; an
 	// unsupported value is simply not offered for that model.
-	defaultReasoningEffort: z.string().default(""),
+	defaultReasoningEffort: z.string().default("").volatile(),
 	// Per-model cloud context-window tiers, as a compact map:
 	// "dmodel=400000,qfmodel=1000000". Each value must be one of that model's
 	// `available_context_windows`; an empty entry inherits `agentContextWindow`.
 	// The Settings card renders this as one dropdown per model.
-	modelContextWindows: z.string().default(""),
+	modelContextWindows: z.string().default("").volatile(),
 	maxTokens: z.number().default(8192),
 	tlsMaxVersion: z.string().default("TLSv1.2"),
 	systemPrompt: z.string().default(""),
@@ -2333,8 +2337,16 @@ function apply(ctx, config) {
 		const registration = ctx.llm.registerAdapter([PROVIDER], adapter);
 		trace("registerAdapter() ok");
 		if (registration?.replace !== void 0) {
-			ctx.on("loader/volatile-update", () => {
-				adapter.reset();
+			ctx.on("loader/volatile-update", (paths) => {
+				// A settings save updates the config boxes in place, so the adapter's
+				// live connection reads already see the new values. Only fields that
+				// change the cloud endpoint/identity invalidate cached Sessions; a
+				// model/effort/context-window save must keep them, because the next
+				// turn patches the live Session (history included) instead of
+				// replaying a fresh one.
+				const invalidating = new Set(["baseURL", "apiKeyEnv", "environmentId", "autoCreateEnvironment"]);
+				const changed = Array.isArray(paths) ? paths.map((path) => path.join(".")) : void 0;
+				if (changed === void 0 || changed.some((path) => invalidating.has(path))) adapter.reset();
 				registration.replace([PROVIDER]);
 			});
 		}
